@@ -1,18 +1,3 @@
-/*
- * STEP 1: Minimal Xen vGPU Stub PCI Device
- * 
- * This is a skeleton implementation showing the minimal code required
- * to create a PCI device visible in VM's lspci output.
- * 
- * File: hw/misc/vgpu-stub.c (for QEMU device model)
- * 
- * Build: Add to QEMU build system and compile
- * Usage: -device vgpu-stub
- * 
- * Success: Device appears in VM's lspci as:
- *   01:00.0 VGA compatible controller: Red Hat, Inc. Device 1111
- */
-
 #include "qemu/osdep.h"
 #include "hw/pci/pci.h"
 #include "hw/qdev-properties.h"
@@ -242,62 +227,4 @@ static void vgpu_register_types(void)
 /* QEMU module initialization */
 type_init(vgpu_register_types);
 
-/*
- * ========================================================================
- * BUILD INSTRUCTIONS
- * ========================================================================
- * 
- * 1. Add this file to QEMU source tree:
- *    cp vgpu-stub.c qemu-source/hw/misc/vgpu-stub.c
- * 
- * 2. Update build system:
- * 
- *    For meson.build (QEMU 5.0+):
- *    Edit: hw/misc/meson.build
- *    Add: softmmu_ss.add(when: 'CONFIG_VGPU_STUB', if_true: files('vgpu-stub.c'))
- * 
- *    For Makefile.objs (older QEMU):
- *    Edit: hw/misc/Makefile.objs
- *    Add: obj-$(CONFIG_VGPU_STUB) += vgpu-stub.o
- * 
- * 3. Add config option:
- *    Edit: configure or meson_options.txt
- *    Add: --enable-vgpu-stub option
- * 
- * 4. Build QEMU:
- *    ./configure --target-list=x86_64-softmmu --enable-vgpu-stub
- *    make -j$(nproc)
- * 
- * 5. Install:
- *    cp x86_64-softmmu/qemu-system-x86_64 /usr/lib/xen/bin/qemu-system-x86_64
- * 
- * 6. Test:
- *    qemu-system-x86_64 -device help | grep vgpu-stub
- *    (Should show: vgpu-stub)
- * 
- * ========================================================================
- * USAGE
- * ========================================================================
- * 
- * Add to VM config (xl format):
- *    device_model_args = [ "-device", "vgpu-stub" ]
- * 
- * Or via command line:
- *    xl create vm.cfg device_model_args='["-device","vgpu-stub"]'
- * 
- * Inside VM, verify:
- *    lspci
- *    (Should show: 01:00.0 Processing accelerator: Red Hat, Inc. Device 1111)
- * 
- * ========================================================================
- * NEXT STEPS (After Step 1 works)
- * ========================================================================
- * 
- * Step 2: Add shared memory ring buffer
- * Step 3: Add event channels for notifications
- * Step 4: Implement guest driver
- * Step 5: Implement mediation daemon
- * 
- * ========================================================================
- */
 
