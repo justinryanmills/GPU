@@ -1,0 +1,11 @@
+--- a/ml/device.go
++++ b/ml/device.go
+@@ -662,6 +662,7 @@ func GetDevicesFromRunner(ctx context.Context, runner BaseRunner) ([]DeviceInfo,
+ 			if err := json.Unmarshal(body, &moreDevices); err != nil {
+ 				slog.Warn("unmarshal encode response", "error", err)
+ 				continue
+ 			}
++			slog.Info("runner /info response", "device_count", len(moreDevices))
+ 			return moreDevices, nil
+ 		}
+ 	}

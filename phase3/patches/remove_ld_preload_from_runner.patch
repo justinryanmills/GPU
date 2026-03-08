@@ -1,0 +1,23 @@
+--- a/llm/server.go
++++ b/llm/server.go
+@@ -446,6 +446,15 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
+ 		}
+ 	}
+ 
++	// Remove LD_PRELOAD from runner so it is not inherited from os.Environ() (vGPU guest: need real dlopen)
++	n := 0
++	for _, e := range cmd.Env {
++		if !strings.HasPrefix(e, "LD_PRELOAD=") {
++			cmd.Env[n] = e
++			n++
++		}
++	}
++	cmd.Env = cmd.Env[:n]
++
+ 	for _, e := range cmd.Env {
+ 		if strings.HasPrefix(e, "LD_PRELOAD=") {
+ 			slog.Info("runner env LD_PRELOAD", "value", e)
+ 			break
+ 		}
+ 	for _, e := range cmd.Env {
+ 		if strings.HasPrefix(e, "OLLAMA_LIBRARY_PATH=") {

@@ -1,0 +1,16 @@
+# Skip second-pass init validation for CUDA so vGPU-discovered devices are not
+# filtered when verification runners crash (connection refused). Apply from
+# ollama repo root: patch -p1 < skip_cuda_init_validation_for_vgpu.patch
+--- a/ml/device.go
++++ b/ml/device.go
+@@ -535,7 +535,8 @@ func GetVisibleDevicesEnv(l []DeviceInfo, mustFilter bool) map[string]string {
+ // NeedsInitValidation returns true if the device in question has the potential
+ // to crash at inference time and requires deeper validation before we include
+ // it in the supported devices list.
+ func (d DeviceInfo) NeedsInitValidation() bool {
+ 	// ROCm: rocblas will crash on unsupported devices.
+ 	// CUDA: verify CC is supported by the version of the library
+-	return d.Library == "ROCm" || d.Library == "CUDA"
++	// Skip CUDA init validation so vGPU-discovered devices are not filtered when verification runners crash.
++	return d.Library == "ROCm"
+ }

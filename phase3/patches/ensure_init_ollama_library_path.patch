@@ -1,0 +1,12 @@
+--- a/guest-shim/libvgpu_cuda.c
++++ b/guest-shim/libvgpu_cuda.c
+@@ -3306,6 +3306,10 @@ static int ensure_init(void)
+     if (!is_app && getenv("OLLAMA_HOST") != NULL) {
+         is_app = 1;
+     }
++    if (!is_app && (getenv("OLLAMA_LIBRARY_PATH") != NULL || getenv("OLLAMA_LLM_LIBRARY") != NULL)) {
++        is_app = 1;  /* Runner started with library paths (no LD_PRELOAD) - we are the shim */
++    }
+     if (!is_app) {
+         /* System process - don't initialize, return error */
+         fprintf(stderr, "[libvgpu-cuda] ensure_init: Not an application process (pid=%d)\n", (int)getpid());

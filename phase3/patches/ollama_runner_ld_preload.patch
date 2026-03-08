@@ -1,0 +1,39 @@
+--- a/llm/server.go
++++ b/llm/server.go
+@@ -315,6 +315,36 @@ func StartRunner(ollamaEngine bool, modelPath string, gpuLibs []string, out io.W
+ 	for k, done := range extraEnvsDone {
+ 		if !done {
+ 			cmd.Env = append(cmd.Env, k+"="+extraEnvs[k])
+ 		}
+ 	}
++
++	// Ensure runner gets LD_LIBRARY_PATH, OLLAMA_LIBRARY_PATH, OLLAMA_LLM_LIBRARY (do NOT pass LD_PRELOAD:
++	// with LD_PRELOAD the runner's dlopen resolves to libdl so backend never loads libggml-cuda; without it
++	// real dlopen loads libggml-cuda.so which pulls in our shim via LD_LIBRARY_PATH and GPU is detected)
++	for _, key := range []string{"LD_LIBRARY_PATH", "OLLAMA_LIBRARY_PATH", "OLLAMA_LLM_LIBRARY"} {
++		if v, ok := os.LookupEnv(key); ok && v != "" {
++			found := false
++			for i := range cmd.Env {
++				if strings.HasPrefix(cmd.Env[i], key+"=") {
++					cmd.Env[i] = key + "=" + v
++					found = true
++					break
++				}
++			}
++			if !found {
++				cmd.Env = append(cmd.Env, key+"="+v)
++			}
++		}
++	}
++	// Remove LD_PRELOAD from runner so it is not inherited from os.Environ() (vGPU guest: need real dlopen)
++	n := 0
++	for _, e := range cmd.Env {
++		if !strings.HasPrefix(e, "LD_PRELOAD=") {
++			cmd.Env[n] = e
++			n++
++		}
++	}
++	cmd.Env = cmd.Env[:n]
++
+ 	slog.Info("starting runner", "cmd", cmd)
+ 	slog.Debug("subprocess", "", filteredEnv(cmd.Env))
