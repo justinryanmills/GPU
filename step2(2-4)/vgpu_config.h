@@ -1,6 +1,3 @@
-/*
- * vGPU Configuration Library Header (Step 2-4)
- */
 #ifndef VGPU_CONFIG_H
 #define VGPU_CONFIG_H
 

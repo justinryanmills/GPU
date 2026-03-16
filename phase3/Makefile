@@ -106,7 +106,7 @@ OLLAMA_WRAPPER_BIN = ollama_vgpu_wrapper
 # ============================================================================
 # Targets
 # ============================================================================
-.PHONY: all host guest client clean install migrate help ollama-wrapper
+.PHONY: all host guest client test-cublas-vm clean install migrate help ollama-wrapper
 
 all: host
 
@@ -136,6 +136,15 @@ guest: $(SHIM_EXEC_INJECT_LIB) $(SHIM_CUDA_LIB) $(SHIM_CUDART_LIB) $(SHIM_NVML_L
 client: $(CLIENT_BIN)
 	@echo "Guest binary built: $(CLIENT_BIN)"
 
+# ---- VM-local CUBLAS test (no host transfer) ------------
+TEST_CUBLAS_VM = $(SHIM_DIR)/test_cublas_vm
+test-cublas-vm: $(TEST_CUBLAS_VM)
+	@echo "Run on VM: LD_LIBRARY_PATH=/opt/vgpu/lib:/usr/local/lib/ollama/cuda_v12:\$$LD_LIBRARY_PATH ./guest-shim/test_cublas_vm"
+
+$(TEST_CUBLAS_VM): $(SHIM_DIR)/test_cublas_vm.c
+	$(CC) $(CFLAGS) -o $@ $< -ldl
+	@echo "[TEST] $@ — VM-local, no host"
+
 # ---- Ollama vGPU wrapper (C binary, no shell) --------------------------------
 $(OLLAMA_WRAPPER_BIN): ollama_vgpu_wrapper.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -151,7 +160,7 @@ ollama-real-wrapper: $(OLLAMA_REAL_WRAPPER_BIN)
 
 # ---- Mediator ---------------------------------------------------------------
 $(MEDIATOR_BIN): $(MEDIATOR_OBJ) $(P3_OBJS) $(CONFIG_OBJ) $(CUDA_OBJ) $(CUDA_EXEC_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(CUDA_LIB) -lcudart -lcuda -lnvidia-ml
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -L$(CUDA_LIB) -lcudart -lcuda -lcublas -lcublasLt -lnvidia-ml
 	@echo "[LINK] $@"
 
 # ---- vgpu-admin CLI --------------------------------------------------------
@@ -186,15 +195,15 @@ $(SHIM_NVML_LIB): $(SHIM_NVML_SRC) $(SHIM_TRANSPORT_SRC) $(SHIM_DIR)/cuda_transp
 		-o $@ $(SHIM_NVML_SRC) $(SHIM_TRANSPORT_SRC) -lpthread
 	@echo "[SHIM] $@"
 
-$(SHIM_CUBLAS_LIB): $(SHIM_CUBLAS_SRC) $(SHIM_DIR)/gpu_properties.h
+$(SHIM_CUBLAS_LIB): $(SHIM_CUBLAS_SRC) $(SHIM_TRANSPORT_SRC) $(SHIM_DIR)/cuda_transport.h $(SHIM_DIR)/gpu_properties.h $(INC_DIR)/cuda_protocol.h
 	@if [ -f "$(SHIM_DIR)/cublas_version.lds" ]; then \
 		$(CC) -shared -fPIC $(CFLAGS) $(SHIM_INCLUDES) \
 			-Wl,--version-script=$(SHIM_DIR)/cublas_version.lds \
-			-o $@ $(SHIM_CUBLAS_SRC) -ldl; \
+			-o $@ $(SHIM_CUBLAS_SRC) $(SHIM_TRANSPORT_SRC) -ldl -lpthread; \
 		echo "[SHIM] $@ (with version script)"; \
 	else \
 		$(CC) -shared -fPIC $(CFLAGS) $(SHIM_INCLUDES) \
-			-o $@ $(SHIM_CUBLAS_SRC) -ldl; \
+			-o $@ $(SHIM_CUBLAS_SRC) $(SHIM_TRANSPORT_SRC) -ldl -lpthread; \
 		echo "[SHIM] $@ (without version script - may need symbol versioning)"; \
 	fi
 
@@ -260,6 +269,7 @@ clean:
 	rm -f $(P3_OBJS) $(MEDIATOR_OBJ) $(CONFIG_OBJ) $(ADMIN_OBJ) $(CUDA_OBJ) $(CUDA_EXEC_OBJ)
 	rm -f $(MEDIATOR_BIN) $(ADMIN_BIN) $(CLIENT_BIN)
 	rm -f $(SHIM_EXEC_INJECT_LIB) $(SHIM_CUDA_LIB) $(SHIM_CUDART_LIB) $(SHIM_NVML_LIB) $(SHIM_CUBLAS_LIB) $(SHIM_CUBLASLT_LIB)
+	rm -f $(TEST_CUBLAS_VM) $(OLLAMA_WRAPPER_BIN) $(OLLAMA_REAL_WRAPPER_BIN)
 	@echo "Clean."
 
 # ---- Help -------------------------------------------------------------------
@@ -336,15 +346,14 @@ qemu-check:
 		echo "ERROR: Source file $(QEMU_STUB_SRC) appears corrupted"; \
 		echo "       The critical check 'sock_rx_len < VGPU_SOCKET_HDR_SIZE' is missing."; \
 		echo ""; \
-		echo "       Expected code at line 430:"; \
-		echo "         if (s->sock_rx_len < VGPU_SOCKET_HDR_SIZE) {"; \
+		echo "       Expected: if (s->sock_rx_len < VGPU_SOCKET_HDR_SIZE) {"; \
 		echo ""; \
 		echo "       Debug info - searching for pattern in file:"; \
 		grep -n "sock_rx_len" "$(QEMU_STUB_SRC)" | head -3 || echo "       (no 'sock_rx_len' found at all)"; \
 		grep -n "VGPU_SOCKET_HDR_SIZE" "$(QEMU_STUB_SRC)" | head -3 || echo "       (no 'VGPU_SOCKET_HDR_SIZE' found at all)"; \
 		echo ""; \
-		echo "       Checking lines around 430:"; \
-		sed -n '428,432p' "$(QEMU_STUB_SRC)" 2>/dev/null | sed 's/^/       /' || echo "       (could not read lines 428-432)"; \
+		LINE=$$(grep -n 'sock_rx_len < VGPU_SOCKET_HDR_SIZE' "$(QEMU_STUB_SRC)" | head -1 | cut -d: -f1); \
+		if [ -n "$$LINE" ]; then echo "       Found at line $$LINE:"; sed -n "$$((LINE-1)),$$((LINE+1))p" "$(QEMU_STUB_SRC)" 2>/dev/null | sed 's/^/       /'; else echo "       (pattern not found)"; fi; \
 		echo ""; \
 		echo "       Action: Copy the correct file from your local machine to the XCP-NG host."; \
 		exit 1; \
@@ -364,7 +373,7 @@ qemu-check:
 		echo "       The 'pci_register_bar' call is missing the memory region parameter."; \
 		exit 1; \
 	fi
-	@echo "RPM build environment verified"
+	@echo "✓ RPM build environment verified"
 	@echo "  Build directory: $(RPM_BUILD)"
 	@echo "  Spec file: $(QEMU_SPEC)"
 	@echo "  Source file integrity: OK"
@@ -381,11 +390,11 @@ qemu-prepare: qemu-check
 	fi
 	@echo "  Copying source files..."
 	@cp "$(QEMU_STUB_SRC)" "$(QEMU_STUB_RPM)"
-	@echo "  Copied $(QEMU_STUB_SRC) → $(QEMU_STUB_RPM)"
+	@echo "  ✓ Copied $(QEMU_STUB_SRC) → $(QEMU_STUB_RPM)"
 	@cp "$(INC_DIR)/vgpu_protocol.h" "$(QEMU_PROTO_RPM)"
-	@echo "  Copied $(INC_DIR)/vgpu_protocol.h → $(QEMU_PROTO_RPM)"
+	@echo "  ✓ Copied $(INC_DIR)/vgpu_protocol.h → $(QEMU_PROTO_RPM)"
 	@cp "$(INC_DIR)/cuda_protocol.h" "$(QEMU_CUDA_PROTO_RPM)"
-	@echo "  Copied $(INC_DIR)/cuda_protocol.h → $(QEMU_CUDA_PROTO_RPM)"
+	@echo "  ✓ Copied $(INC_DIR)/cuda_protocol.h → $(QEMU_CUDA_PROTO_RPM)"
 	@echo "  Verifying file integrity..."
 	@if ! grep -q 'connect(fd,' "$(QEMU_STUB_RPM)"; then \
 		echo "  ✗ ERROR: File corruption detected in $(QEMU_STUB_RPM)"; \
@@ -420,15 +429,14 @@ qemu-prepare: qemu-check
 		echo "  ✗ ERROR: File corruption detected in $(QEMU_STUB_RPM)"; \
 		echo "     The critical check 'sock_rx_len < VGPU_SOCKET_HDR_SIZE' is missing or corrupted."; \
 		echo ""; \
-		echo "     Expected code at line 430:"; \
-		echo "       if (s->sock_rx_len < VGPU_SOCKET_HDR_SIZE) {"; \
+		echo "     Expected: if (s->sock_rx_len < VGPU_SOCKET_HDR_SIZE) {"; \
 		echo ""; \
 		echo "     Debug info - searching for pattern in copied file:"; \
 		grep -n "sock_rx_len" "$(QEMU_STUB_RPM)" | head -3 || echo "     (no 'sock_rx_len' found at all)"; \
 		grep -n "VGPU_SOCKET_HDR_SIZE" "$(QEMU_STUB_RPM)" | head -3 || echo "     (no 'VGPU_SOCKET_HDR_SIZE' found at all)"; \
 		echo ""; \
-		echo "     Checking lines around 430:"; \
-		sed -n '428,432p' "$(QEMU_STUB_RPM)" 2>/dev/null | sed 's/^/     /' || echo "     (could not read lines 428-432)"; \
+		LINE=$$(grep -n 'sock_rx_len < VGPU_SOCKET_HDR_SIZE' "$(QEMU_STUB_RPM)" | head -1 | cut -d: -f1); \
+		if [ -n "$$LINE" ]; then echo "     Found at line $$LINE:"; sed -n "$$((LINE-1)),$$((LINE+1))p" "$(QEMU_STUB_RPM)" 2>/dev/null | sed 's/^/     /'; else echo "     (pattern not found)"; fi; \
 		echo ""; \
 		echo "     Action: The file was corrupted during copy. Check the source file and try again."; \
 		exit 1; \
@@ -460,7 +468,7 @@ qemu-prepare: qemu-check
 		echo "     The 'pci_register_bar' call is missing the memory region parameter."; \
 		exit 1; \
 	fi
-	@echo "  File integrity verified"
+	@echo "  ✓ File integrity verified"
 
 # ---- Spec file integration ------------------------------------------------
 # Modify qemu.spec to include vgpu-stub sources and build integration
@@ -469,23 +477,23 @@ qemu-integrate: qemu-prepare
 	@if ! grep -q "Source3: vgpu-stub.c" "$(QEMU_SPEC)"; then \
 		echo "  Adding Source3 line for vgpu-stub.c..."; \
 		sed -i '/^Source2:/a Source3: vgpu-stub.c' "$(QEMU_SPEC)"; \
-		echo "  Added Source3: vgpu-stub.c"; \
+		echo "  ✓ Added Source3: vgpu-stub.c"; \
 	else \
-		echo "  Source3 already present"; \
+		echo "  ✓ Source3 already present"; \
 	fi
 	@if ! grep -q "Source4: vgpu_protocol.h" "$(QEMU_SPEC)"; then \
 		echo "  Adding Source4 line for vgpu_protocol.h..."; \
 		sed -i '/^Source3:/a Source4: vgpu_protocol.h' "$(QEMU_SPEC)"; \
-		echo "  Added Source4: vgpu_protocol.h"; \
+		echo "  ✓ Added Source4: vgpu_protocol.h"; \
 	else \
-		echo "  Source4 already present"; \
+		echo "  ✓ Source4 already present"; \
 	fi
 	@if ! grep -q "Source5: cuda_protocol.h" "$(QEMU_SPEC)"; then \
 		echo "  Adding Source5 line for cuda_protocol.h..."; \
 		sed -i '/^Source4:/a Source5: cuda_protocol.h' "$(QEMU_SPEC)"; \
-		echo "  Added Source5: cuda_protocol.h"; \
+		echo "  ✓ Added Source5: cuda_protocol.h"; \
 	else \
-		echo "  Source5 already present"; \
+		echo "  ✓ Source5 already present"; \
 	fi
 	@if ! grep -q "cp -a %{SOURCE4}" "$(QEMU_SPEC)"; then \
 		echo "  Adding protocol header copy to spec..."; \
@@ -493,7 +501,7 @@ qemu-integrate: qemu-prepare
 			sed -i '/cp -a %{SOURCE3} hw\/misc\/vgpu-stub.c/a \
 cp -a %{SOURCE4} hw/misc/vgpu_protocol.h\
 cp -a %{SOURCE5} hw/misc/cuda_protocol.h' "$(QEMU_SPEC)"; \
-			echo "  Added copy of vgpu_protocol.h and cuda_protocol.h to hw/misc/"; \
+			echo "  ✓ Added copy of vgpu_protocol.h and cuda_protocol.h to hw/misc/"; \
 		else \
 			sed -i '/tar xzf.*SOURCE2/a \
 \
@@ -502,31 +510,31 @@ cp -a %{SOURCE3} hw/misc/vgpu-stub.c\
 cp -a %{SOURCE4} hw/misc/vgpu_protocol.h\
 cp -a %{SOURCE5} hw/misc/cuda_protocol.h\
 echo "obj-y += vgpu-stub.o" >> hw/misc/Makefile.objs' "$(QEMU_SPEC)"; \
-			echo "  Added full vgpu integration block"; \
+			echo "  ✓ Added full vgpu integration block"; \
 		fi; \
 	else \
-		echo "  Protocol header copy already in spec"; \
+		echo "  ✓ Protocol header copy already in spec"; \
 	fi
 	@if ! grep -q "cp -a %{SOURCE5}" "$(QEMU_SPEC)"; then \
 		echo "  Adding cuda_protocol.h copy to spec..."; \
 		sed -i '/cp -a %{SOURCE4} hw\/misc\/vgpu_protocol.h/a \
 cp -a %{SOURCE5} hw/misc/cuda_protocol.h' "$(QEMU_SPEC)"; \
-		echo "  Added copy of cuda_protocol.h to hw/misc/"; \
+		echo "  ✓ Added copy of cuda_protocol.h to hw/misc/"; \
 	else \
-		echo "  cuda_protocol.h copy already in spec"; \
+		echo "  ✓ cuda_protocol.h copy already in spec"; \
 	fi
 	@if ! grep -q "vgpu-stub.o" "$(QEMU_SPEC)"; then \
 		sed -i '/cp -a %{SOURCE4} hw\/misc\/vgpu_protocol.h/a \
 echo "obj-y += vgpu-stub.o" >> hw/misc/Makefile.objs' "$(QEMU_SPEC)"; \
-		echo "  Added Makefile.objs integration"; \
+		echo "  ✓ Added Makefile.objs integration"; \
 	else \
-		echo "  Makefile.objs integration present"; \
+		echo "  ✓ Makefile.objs integration present"; \
 	fi
 	@if ! grep -q "\-\-disable-werror" "$(QEMU_SPEC)"; then \
 		sed -i 's/--enable-werror/--disable-werror/' "$(QEMU_SPEC)"; \
-		echo "  Switched to --disable-werror"; \
+		echo "  ✓ Switched to --disable-werror"; \
 	else \
-		echo "  --disable-werror already set"; \
+		echo "  ✓ --disable-werror already set"; \
 	fi
 	@echo ""
 	@echo "Verifying spec file..."
@@ -555,9 +563,9 @@ qemu-build: qemu-integrate
 		echo "Check /tmp/qemu-build.log for details."; \
 		exit 1; \
 	else \
-		echo "  Built: $$RPM_FILE"; \
+		echo "  ✓ Built: $$RPM_FILE"; \
 	fi
-	@echo "  QEMU RPM build complete"
+	@echo "  ✓ QEMU RPM build complete"
 
 # ---- Install QEMU RPM (optional) -------------------------------------------
 qemu-install: qemu-build
@@ -574,7 +582,7 @@ qemu-install: qemu-build
 	echo; \
 	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
 		sudo rpm -Uvh --nodeps --force "$$RPM_FILE"; \
-		echo "  QEMU installed"; \
+		echo "  ✓ QEMU installed"; \
 		echo ""; \
 		echo "  Verification:"; \
 		QEMU_BIN="/usr/lib64/xen/bin/qemu-system-i386"; \
@@ -582,7 +590,7 @@ qemu-install: qemu-build
 			echo -n "    QEMU version: "; $$QEMU_BIN --version 2>/dev/null | head -1; \
 			echo -n "    vgpu-cuda device: "; \
 			if $$QEMU_BIN -device help 2>/dev/null | grep -q "vgpu-cuda"; then \
-				echo "AVAILABLE"; \
+				echo "✓ AVAILABLE"; \
 			else \
 				echo "✗ NOT FOUND"; \
 			fi; \
@@ -633,7 +641,7 @@ qemu-clean:
 		echo "  Removing build log..."; \
 		rm -f /tmp/qemu-build.log; \
 	fi
-	@echo "  QEMU build artifacts cleaned"
+	@echo "  ✓ QEMU build artifacts cleaned"
 	@echo ""
 	@echo "Note: This does NOT remove:"
 	@echo "  - RPM build directory structure ($(RPM_BUILD))"

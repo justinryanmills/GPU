@@ -1,23 +1,11 @@
-/*
- * Phase 3: CUDA API remoting protocol (guest shim <-> host executor).
- */
 #ifndef CUDA_PROTOCOL_H
 #define CUDA_PROTOCOL_H
 
 #include <stdint.h>
 
-/* ================================================================
- * CUDA API Call Identifiers
- *
- * Each CUDA Driver API function that we intercept is assigned a
- * unique call_id.  Grouped by functional category.
- * ================================================================ */
-
-/* --- Initialisation & version ----------------------------------- */
 #define CUDA_CALL_INIT                      0x0001
 #define CUDA_CALL_DRIVER_GET_VERSION        0x0002
 
-/* --- Device management ------------------------------------------ */
 #define CUDA_CALL_DEVICE_GET_COUNT          0x0010
 #define CUDA_CALL_DEVICE_GET                0x0011
 #define CUDA_CALL_DEVICE_GET_NAME           0x0012
@@ -28,7 +16,6 @@
 #define CUDA_CALL_DEVICE_GET_PROPERTIES     0x0017
 #define CUDA_CALL_DEVICE_GET_P2P_ATTRIBUTE  0x0018
 
-/* --- Context management ----------------------------------------- */
 #define CUDA_CALL_CTX_CREATE                0x0020
 #define CUDA_CALL_CTX_DESTROY               0x0021
 #define CUDA_CALL_CTX_SET_CURRENT           0x0022
@@ -39,7 +26,6 @@
 #define CUDA_CALL_CTX_GET_DEVICE            0x0027
 #define CUDA_CALL_CTX_GET_API_VERSION       0x0028
 
-/* --- Memory management ------------------------------------------ */
 #define CUDA_CALL_MEM_ALLOC                 0x0030
 #define CUDA_CALL_MEM_FREE                  0x0031
 #define CUDA_CALL_MEMCPY_HTOD               0x0032
@@ -56,7 +42,6 @@
 #define CUDA_CALL_MEMCPY_DTOH_ASYNC         0x003D
 #define CUDA_CALL_MEMCPY_DTOD_ASYNC         0x003E
 
-/* --- Module / function management ------------------------------- */
 #define CUDA_CALL_MODULE_LOAD_DATA          0x0040
 #define CUDA_CALL_MODULE_LOAD_DATA_EX       0x0041
 #define CUDA_CALL_MODULE_LOAD_FAT_BINARY    0x0042
@@ -64,11 +49,9 @@
 #define CUDA_CALL_MODULE_GET_FUNCTION       0x0044
 #define CUDA_CALL_MODULE_GET_GLOBAL         0x0045
 
-/* --- Kernel launch ---------------------------------------------- */
 #define CUDA_CALL_LAUNCH_KERNEL             0x0050
 #define CUDA_CALL_LAUNCH_COOPERATIVE_KERNEL 0x0051
 
-/* --- Stream management ------------------------------------------ */
 #define CUDA_CALL_STREAM_CREATE             0x0060
 #define CUDA_CALL_STREAM_CREATE_WITH_FLAGS  0x0061
 #define CUDA_CALL_STREAM_CREATE_WITH_PRIORITY 0x0062
@@ -77,7 +60,6 @@
 #define CUDA_CALL_STREAM_QUERY              0x0065
 #define CUDA_CALL_STREAM_WAIT_EVENT         0x0066
 
-/* --- Event management ------------------------------------------- */
 #define CUDA_CALL_EVENT_CREATE              0x0070
 #define CUDA_CALL_EVENT_CREATE_WITH_FLAGS   0x0071
 #define CUDA_CALL_EVENT_DESTROY             0x0072
@@ -86,28 +68,38 @@
 #define CUDA_CALL_EVENT_QUERY               0x0075
 #define CUDA_CALL_EVENT_ELAPSED_TIME        0x0076
 
-/* --- Texture / surface (stub: return NOT_SUPPORTED) ------------- */
 #define CUDA_CALL_TEX_CREATE                0x0080
 #define CUDA_CALL_TEX_DESTROY               0x0081
 
-/* --- Primary context -------------------------------------------- */
 #define CUDA_CALL_DEVICE_PRIMARY_CTX_RETAIN   0x0090
 #define CUDA_CALL_DEVICE_PRIMARY_CTX_RELEASE  0x0091
 #define CUDA_CALL_DEVICE_PRIMARY_CTX_RESET    0x0092
 #define CUDA_CALL_DEVICE_PRIMARY_CTX_SET_FLAGS 0x0093
 #define CUDA_CALL_DEVICE_PRIMARY_CTX_GET_STATE 0x0094
 
-/* --- Occupancy -------------------------------------------------- */
 #define CUDA_CALL_OCCUPANCY_MAX_ACTIVE_BLOCKS 0x00A0
 #define CUDA_CALL_OCCUPANCY_MAX_POTENTIAL_BLOCK_SIZE 0x00A1
 
-/* --- Misc ------------------------------------------------------- */
+#define CUDA_CALL_LIBRARY_LOAD_DATA          0x00A8
+#define CUDA_CALL_LIBRARY_UNLOAD             0x00A9
+#define CUDA_CALL_LIBRARY_GET_MODULE         0x00AA
+
+#define CUDA_CALL_CUBLAS_CREATE              0x00AC
+#define CUDA_CALL_CUBLAS_DESTROY             0x00AD
+#define CUDA_CALL_CUBLAS_SET_STREAM          0x00AE
+#define CUDA_CALL_CUBLAS_GET_STREAM          0x00AF
+#define CUDA_CALL_CUBLAS_SGEMM               0x00B4
+#define CUDA_CALL_CUBLAS_GEMM_EX             0x00B5
+#define CUDA_CALL_CUBLAS_GEMM_STRIDED_BATCHED_EX 0x00B6
+#define CUDA_CALL_CUBLASLT_CREATE            0x00B7
+#define CUDA_CALL_CUBLASLT_DESTROY           0x00B8
+#define CUDA_CALL_CUBLASLT_MATMUL            0x00B9
+
 #define CUDA_CALL_FUNC_GET_ATTRIBUTE        0x00B0
 #define CUDA_CALL_FUNC_SET_CACHE_CONFIG     0x00B1
 #define CUDA_CALL_GET_ERROR_STRING          0x00B2
 #define CUDA_CALL_GET_ERROR_NAME            0x00B3
 
-/* --- GPU info query (custom, host-side NVML query) -------------- */
 #define CUDA_CALL_GET_GPU_INFO              0x00F0
 
 /* Maximum call_id sentinel */
@@ -123,7 +115,13 @@
 /* Maximum inline result values */
 #define CUDA_MAX_INLINE_RESULTS 8  /* 8 x uint64 */
 
-/* CUDACallHeader: guest -> host; args[] or payload per data_len. */
+/*
+ * CUDACallHeader — sent from guest to host for every CUDA API call.
+ *
+ * For calls with small arguments, everything fits in `args[]`.
+ * For calls with bulk data (e.g. cuMemcpyHtoD), the data follows
+ * this header as a payload of `data_len` bytes.
+ */
 typedef struct __attribute__((packed)) CUDACallHeader {
     uint32_t magic;                         /* VGPU_SOCKET_MAGIC (0x56475055) */
     uint32_t call_id;                       /* CUDA_CALL_* identifier         */
@@ -136,7 +134,13 @@ typedef struct __attribute__((packed)) CUDACallHeader {
 
 #define CUDA_CALL_HEADER_SIZE  sizeof(CUDACallHeader)
 
-/* CUDACallResult: host -> guest; status, results[], optional payload. */
+/*
+ * CUDACallResult — sent from host back to guest.
+ *
+ * `status` is a CUresult value (0 = CUDA_SUCCESS).
+ * Output values are packed in `results[]`.
+ * If `data_len > 0`, bulk return data follows this header.
+ */
 typedef struct __attribute__((packed)) CUDACallResult {
     uint32_t magic;                         /* VGPU_SOCKET_MAGIC              */
     uint32_t seq_num;                       /* Matches the request seq_num    */
@@ -149,7 +153,63 @@ typedef struct __attribute__((packed)) CUDACallResult {
 
 #define CUDA_CALL_RESULT_SIZE  sizeof(CUDACallResult)
 
-/* CUDAGpuInfo: returned by CUDA_CALL_GET_GPU_INFO for guest init. */
+/*
+ * CUBLAS SGEMM payload.
+ *
+ * Sent as bulk request data for CUDA_CALL_CUBLAS_SGEMM because the full
+ * argument set does not fit in the inline args[] area.
+ */
+typedef struct __attribute__((packed)) CublasSgemmCall {
+    uint64_t handle;
+    uint64_t a;
+    uint64_t b;
+    uint64_t c;
+    int32_t  transa;
+    int32_t  transb;
+    int32_t  m;
+    int32_t  n;
+    int32_t  k;
+    int32_t  lda;
+    int32_t  ldb;
+    int32_t  ldc;
+    float    alpha;
+    float    beta;
+} CublasSgemmCall;
+
+/*
+ * CUBLAS GEMM_EX payload.
+ *
+ * Uses inline scalar values for alpha/beta as float to keep payload fixed-size.
+ * This matches the current ggml-cuda usage path where alpha/beta are 1.0/0.0.
+ */
+typedef struct __attribute__((packed)) CublasGemmExCall {
+    uint64_t handle;
+    uint64_t a;
+    uint64_t b;
+    uint64_t c;
+    int32_t  transa;
+    int32_t  transb;
+    int32_t  m;
+    int32_t  n;
+    int32_t  k;
+    int32_t  Atype;
+    int32_t  Btype;
+    int32_t  Ctype;
+    int32_t  lda;
+    int32_t  ldb;
+    int32_t  ldc;
+    int32_t  computeType;
+    int32_t  algo;
+    float    alpha_f32;
+    float    beta_f32;
+} CublasGemmExCall;
+
+/* ================================================================
+ * GPU Info structure (returned by CUDA_CALL_GET_GPU_INFO)
+ *
+ * Queried once at guest init time so the shim can answer
+ * cuDeviceGetAttribute / cuDeviceGetName locally.
+ * ================================================================ */
 typedef struct __attribute__((packed)) CUDAGpuInfo {
     char     name[256];              /* Device name, e.g. "NVIDIA H100 ..." */
     uint8_t  uuid[16];              /* Device UUID                          */
@@ -190,7 +250,18 @@ typedef struct __attribute__((packed)) CUDAGpuInfo {
 
 #define CUDA_GPU_INFO_SIZE  sizeof(CUDAGpuInfo)
 
-/* CUDALaunchParams: grid/block dims, shared mem, stream; then param_sizes[], param_data[]. */
+/* ================================================================
+ * Kernel launch parameter encoding
+ *
+ * When cuLaunchKernel is called, the kernel parameters are passed
+ * as void **kernelParams.  We serialise them into a flat buffer
+ * that follows the CUDACallHeader.
+ *
+ * Layout of launch payload:
+ *   [CUDALaunchParams]            — grid/block dims, shared mem, etc.
+ *   [param_sizes[num_params]]     — uint32 array of each param size
+ *   [param_data...]               — concatenated raw param bytes
+ * ================================================================ */
 typedef struct __attribute__((packed)) CUDALaunchParams {
     uint64_t function_handle;       /* Host-side CUfunction handle     */
     uint32_t grid_dim_x;
@@ -209,17 +280,49 @@ typedef struct __attribute__((packed)) CUDALaunchParams {
 
 #define CUDA_LAUNCH_PARAMS_SIZE  sizeof(CUDALaunchParams)
 
-/* cuModuleLoadData: PTX/CUBIN in payload; data_len in header. */
-/* cuMemcpyHtoD: args = dst, count; payload = host data. cuMemcpyDtoH: args = src, count; response payload = device data. */
-/* Chunked transfer: data > CUDA_MAX_CHUNK_SIZE split into messages; chunk flags in args[14]. */
+/* ================================================================
+ * Module load payload
+ *
+ * When cuModuleLoadData is called, the PTX/CUBIN data follows
+ * the CUDACallHeader.  data_len in the header gives the size.
+ * The host JIT-compiles it and returns a module handle.
+ * ================================================================ */
+
+/* ================================================================
+ * Memory copy payload
+ *
+ * For cuMemcpyHtoD: host data follows the CUDACallHeader.
+ *   args[0..1] = dst device pointer (uint64)
+ *   args[2..3] = byte count (uint64)
+ *   data_len   = byte count
+ *   payload    = source data
+ *
+ * For cuMemcpyDtoH: no payload in the request.
+ *   args[0..1] = src device pointer (uint64)
+ *   args[2..3] = byte count (uint64)
+ *   Response has data_len = byte count, payload = device data.
+ * ================================================================ */
+
+/* ================================================================
+ * Chunked transfer support
+ *
+ * For data larger than CUDA_MAX_CHUNK_SIZE, the transfer is split
+ * into multiple messages with the same seq_num but with chunk
+ * metadata encoded in args[].
+ * ================================================================ */
 #define CUDA_MAX_CHUNK_SIZE  (4 * 1024 * 1024)  /* 4 MB per chunk */
 
 /* Chunk flags (stored in args[14] for chunked calls) */
 #define CUDA_CHUNK_FLAG_FIRST  0x01
 #define CUDA_CHUNK_FLAG_LAST   0x02
+#define CUDA_CHUNK_FLAG_MIDDLE 0x04
 #define CUDA_CHUNK_FLAG_SINGLE 0x03  /* FIRST | LAST */
 
-/* args[] are uint32_t; uint64 = two consecutive slots. */
+/* ================================================================
+ * Helper macros for packing/unpacking uint64 values in args[]
+ *
+ * args[] are uint32_t.  A uint64 occupies two consecutive slots.
+ * ================================================================ */
 #define CUDA_PACK_U64(args, idx, val) do {          \
     (args)[(idx)]     = (uint32_t)((val) & 0xFFFFFFFF);  \
     (args)[(idx) + 1] = (uint32_t)(((val) >> 32) & 0xFFFFFFFF); \

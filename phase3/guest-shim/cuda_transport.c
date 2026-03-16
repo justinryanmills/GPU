@@ -1,4 +1,214 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE  /* Required for RTLD_DEFAULT */
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <dlfcn.h>
+#include <pthread.h>
+
+#include "cuda_transport.h"
+#include "cuda_protocol.h"
+
+#ifndef CUDA_CHUNK_FLAG_MIDDLE
+#define CUDA_CHUNK_FLAG_MIDDLE 0x04
+#endif
+
+/* Error codes for debug reporting */
+#ifndef VGPU_ERR_INVALID_REQUEST
+#define VGPU_ERR_INVALID_REQUEST     0x01
+#define VGPU_ERR_REQUEST_TOO_LARGE   0x02
+#define VGPU_ERR_CUDA_ERROR          0x05
+#define VGPU_ERR_INVALID_POOL        0x06
+#define VGPU_ERR_UNSUPPORTED_OP      0x08
+#define VGPU_ERR_INVALID_LENGTH      0x09
+#endif
+
+#ifndef VGPU_ERR_MEDIATOR_UNAVAIL
+#define VGPU_ERR_MEDIATOR_UNAVAIL  0x03
+#define VGPU_ERR_TIMEOUT           0x04
+#define VGPU_ERR_QUEUE_FULL        0x07
+#define VGPU_ERR_RATE_LIMITED      0x0A
+#define VGPU_ERR_VM_QUARANTINED    0x0B
+#endif
+
+#define DEBUG_CALL_HISTORY_SIZE 24
+
+typedef struct {
+    uint32_t call_id;
+    uint32_t seq;
+    int      status;   /* 0=OK, 2=transport err, else CUDA status */
+    uint32_t transport_err;
+} debug_call_entry_t;
+
+static debug_call_entry_t g_call_history[DEBUG_CALL_HISTORY_SIZE];
+static int g_call_history_head = 0;
+static int g_call_history_count = 0;
+static char g_checkpoint_trail[256] = "";
+
+static const char *call_id_to_name(uint32_t call_id)
+{
+    if (call_id == 0) return "(init/connect)";
+    switch (call_id) {
+        case CUDA_CALL_INIT: return "cuInit";
+        case CUDA_CALL_DEVICE_GET_COUNT: return "cuDeviceGetCount";
+        case CUDA_CALL_DEVICE_GET: return "cuDeviceGet";
+        case CUDA_CALL_DEVICE_GET_NAME: return "cuDeviceGetName";
+        case CUDA_CALL_DEVICE_GET_ATTRIBUTE: return "cuDeviceGetAttribute";
+        case CUDA_CALL_DEVICE_TOTAL_MEM: return "cuDeviceTotalMem";
+        case CUDA_CALL_DEVICE_PRIMARY_CTX_RETAIN: return "cuDevicePrimaryCtxRetain";
+        case CUDA_CALL_DEVICE_PRIMARY_CTX_RELEASE: return "cuDevicePrimaryCtxRelease";
+        case CUDA_CALL_CTX_CREATE: return "cuCtxCreate_v2";
+        case CUDA_CALL_CTX_DESTROY: return "cuCtxDestroy_v2";
+        case CUDA_CALL_CTX_SET_CURRENT: return "cuCtxSetCurrent";
+        case CUDA_CALL_CTX_GET_CURRENT: return "cuCtxGetCurrent";
+        case CUDA_CALL_CTX_SYNCHRONIZE: return "cuCtxSynchronize";
+        case CUDA_CALL_MEM_ALLOC: return "cuMemAlloc_v2";
+        case CUDA_CALL_MEM_FREE: return "cuMemFree_v2";
+        case CUDA_CALL_MEMCPY_HTOD: return "cuMemcpyHtoD_v2";
+        case CUDA_CALL_MEMCPY_DTOH: return "cuMemcpyDtoH_v2";
+        case CUDA_CALL_MEMCPY_DTOD: return "cuMemcpyDtoD_v2";
+        case CUDA_CALL_MODULE_LOAD_DATA: return "cuModuleLoadData";
+        case CUDA_CALL_MODULE_GET_FUNCTION: return "cuModuleGetFunction";
+        case CUDA_CALL_LAUNCH_KERNEL: return "cuLaunchKernel";
+        case CUDA_CALL_STREAM_CREATE: return "cuStreamCreate";
+        case CUDA_CALL_STREAM_SYNCHRONIZE: return "cuStreamSynchronize";
+        case CUDA_CALL_GET_GPU_INFO: return "cuGetGpuInfo";
+        default: return "?(call_id)";
+    }
+}
+
+static void debug_record_call(uint32_t call_id, uint32_t seq, int status, uint32_t transport_err)
+{
+    int i = g_call_history_head % DEBUG_CALL_HISTORY_SIZE;
+    g_call_history[i].call_id = call_id;
+    g_call_history[i].seq = seq;
+    g_call_history[i].status = status;
+    g_call_history[i].transport_err = transport_err;
+    g_call_history_head++;
+    if (g_call_history_count < DEBUG_CALL_HISTORY_SIZE) g_call_history_count++;
+}
+
+static void debug_write_report(const char *code, uint32_t failing_call_id,
+                               uint32_t transport_err, const char *detail)
+{
+    char buf[4096];
+    size_t off = 0;
+    time_t now = time(NULL);
+    const char *call_name = call_id_to_name(failing_call_id);
+    const char *err_str = (transport_err == VGPU_ERR_MEDIATOR_UNAVAIL) ? "MEDIATOR_UNAVAIL" :
+                          (transport_err == VGPU_ERR_TIMEOUT) ? "TIMEOUT" :
+                          (transport_err == VGPU_ERR_QUEUE_FULL) ? "QUEUE_FULL" :
+                          (transport_err == VGPU_ERR_RATE_LIMITED) ? "RATE_LIMITED" :
+                          (transport_err == VGPU_ERR_VM_QUARANTINED) ? "VM_QUARANTINED" : "OTHER";
+
+    off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+        "===============================================================================\n"
+        "VGPU DEBUG REPORT — Exact error diagnosis\n"
+        "===============================================================================\n"
+        "timestamp: %ld  pid: %d\n\n"
+        ">>> WHAT FAILED: %s\n"
+        ">>> FAILING CALL: %s (call_id=0x%04x)\n"
+        ">>> TRANSPORT ERR: 0x%08x (%s)\n"
+        ">>> DETAIL: %s\n\n",
+        (long)now, (int)getpid(),
+        code ? code : "UNKNOWN",
+        call_name, failing_call_id,
+        transport_err, err_str,
+        detail ? detail : "(none)");
+
+    off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+        "--- RECENT CALL HISTORY (oldest first) ---\n");
+    for (int i = 0; i < g_call_history_count; i++) {
+        int idx = (g_call_history_head - g_call_history_count + i + DEBUG_CALL_HISTORY_SIZE)
+                  % DEBUG_CALL_HISTORY_SIZE;
+        const debug_call_entry_t *e = &g_call_history[idx];
+        const char *r = (e->status == 0) ? "OK" : (e->status == 2) ? "ERR" : "CUDA_ERR";
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            "  %2d. 0x%04x %-30s seq=%u  -> %s\n",
+            i + 1, e->call_id, call_id_to_name(e->call_id), e->seq, r);
+    }
+    off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+        "\n--- CHECKPOINT TRAIL ---\n%s\n\n",
+        g_checkpoint_trail);
+
+    if (strcmp(code, "MEDIATOR_UNAVAIL") == 0)
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            ">>> LIKELY CAUSE: Host mediator not running. Start mediator_phase3 on host.\n");
+    else if (strcmp(code, "TRANSPORT_TIMEOUT") == 0)
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            ">>> LIKELY CAUSE: Host hung or slow. Check mediator logs, increase CUDA_TRANSPORT_TIMEOUT_SEC.\n");
+    else if (strcmp(code, "DEVICE_NOT_FOUND") == 0)
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            ">>> LIKELY CAUSE: VGPU-STUB PCI device missing. Add -device vgpu-cuda to QEMU.\n");
+    else if (strcmp(code, "BAR0_OPEN_FAILED") == 0)
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            ">>> LIKELY CAUSE: Permission or sandbox blocking resource0. Check systemd ReadWritePaths.\n");
+    else if (strcmp(code, "CUDA_CALL_FAILED") == 0)
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            ">>> LIKELY CAUSE: Host GPU returned CUDA error. Check mediator/host CUDA logs.\n");
+
+    int fd = (int)syscall(__NR_open, "/tmp/vgpu_debug.txt",
+                          (O_WRONLY | O_CREAT | O_TRUNC), 0666);
+    if (fd >= 0) {
+        syscall(__NR_write, fd, buf, off);
+        syscall(__NR_close, fd);
+    }
+    /* Also keep short canonical line for scripts */
+    fd = (int)syscall(__NR_open, "/tmp/vgpu_last_error",
+                      (O_WRONLY | O_CREAT | O_TRUNC), 0666);
+    if (fd >= 0) {
+        int n = snprintf(buf, sizeof(buf), "VGPU_ERR|%ld|%s|0x%04x|0x%08x|%s\n",
+                         (long)now, code ? code : "UNKNOWN", failing_call_id, transport_err,
+                         detail ? detail : "");
+        if (n > 0 && n < (int)sizeof(buf))
+            syscall(__NR_write, fd, buf, (size_t)n);
+        syscall(__NR_close, fd);
+    }
+}
+
+void cuda_transport_write_error(const char *code, uint32_t call_id,
+                                uint32_t transport_err, const char *detail)
+{
+    debug_write_report(code, call_id, transport_err, detail);
+}
+
+void cuda_transport_clear_debug_state(void)
+{
+    g_call_history_head = 0;
+    g_call_history_count = 0;
+    g_checkpoint_trail[0] = '\0';
+}
+
+void cuda_transport_write_checkpoint(const char *phase)
+{
+    size_t len = strlen(g_checkpoint_trail);
+    if (len > 0) {
+        snprintf(g_checkpoint_trail + len, sizeof(g_checkpoint_trail) - len, " -> %s", phase);
+    } else {
+        snprintf(g_checkpoint_trail, sizeof(g_checkpoint_trail), "%s", phase);
+    }
+    char buf[256];
+    time_t now = time(NULL);
+    int n = snprintf(buf, sizeof(buf), "VGPU_CHECKPOINT|%ld|%s\n", (long)now, phase);
+    if (n <= 0 || n >= (int)sizeof(buf)) return;
+    int fd = (int)syscall(__NR_open, "/tmp/vgpu_checkpoint",
+                         (O_WRONLY | O_CREAT | O_TRUNC), 0666);
+    if (fd >= 0) {
+        syscall(__NR_write, fd, buf, (size_t)n);
+        syscall(__NR_close, fd);
+    }
+}
 
 /*
  * CUDA Transport — guest-side communication layer
@@ -32,29 +242,15 @@
  *   far fewer round-trips than the 4 MB BAR1 chunks.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <errno.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <dlfcn.h>
-
-#include "cuda_transport.h"
-#include "cuda_protocol.h"
-
 /* When VGPU_DEBUG is unset, skip per-call and verbose discovery logging to avoid inference delay. */
 static int vgpu_debug_logging(void) {
     static int cached = -1;
     if (cached < 0) cached = (getenv("VGPU_DEBUG") != NULL) ? 1 : 0;
     return cached;
 }
+
+/* Serialize all transport round-trips so one thread cannot read another's result from BAR0. */
+static pthread_mutex_t g_transport_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Forward declaration */
 static void call_libvgpu_set_skip_interception(int skip);
@@ -116,9 +312,26 @@ static void call_libvgpu_set_skip_interception(int skip);
 #define STATUS_DONE   0x02
 #define STATUS_ERROR  0x03
 
+#define VGPU_ERR_NONE              0x00
+#define VGPU_ERR_MEDIATOR_UNAVAIL  0x03
+#define VGPU_ERR_TIMEOUT           0x04
+#define VGPU_ERR_QUEUE_FULL        0x07
+#define VGPU_ERR_RATE_LIMITED      0x0A
+#define VGPU_ERR_VM_QUARANTINED    0x0B
+
 /* Polling */
 #define POLL_INTERVAL_US  100
-#define POLL_TIMEOUT_SEC  60
+#define POLL_TIMEOUT_SEC_DEFAULT  60
+/* Override via CUDA_TRANSPORT_TIMEOUT_SEC (e.g. 120) when mediator is slow. */
+static int poll_timeout_sec(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CUDA_TRANSPORT_TIMEOUT_SEC");
+        cached = (e && *e) ? (int)strtol(e, NULL, 10) : POLL_TIMEOUT_SEC_DEFAULT;
+        if (cached <= 0) cached = POLL_TIMEOUT_SEC_DEFAULT;
+    }
+    return cached;
+}
 
 /* BAR1 legacy regions */
 #define BAR1_GUEST_TO_HOST_OFFSET  0x000000
@@ -138,6 +351,25 @@ static void call_libvgpu_set_skip_interception(int skip);
  * Accessible even when the transport struct has not been allocated yet
  * (e.g. when the caller only needs the address for cuDeviceGetPCIBusId). */
 static char g_discovered_bdf[256] = "";  /* Increased from 64 to 256 to match dirent->d_name max size */
+
+static const char *vgpu_err_to_str(uint32_t err)
+{
+    switch (err) {
+        case VGPU_ERR_NONE: return "NONE";
+        case VGPU_ERR_INVALID_REQUEST: return "INVALID_REQUEST";
+        case VGPU_ERR_REQUEST_TOO_LARGE: return "REQUEST_TOO_LARGE";
+        case VGPU_ERR_MEDIATOR_UNAVAIL: return "MEDIATOR_UNAVAIL";
+        case VGPU_ERR_TIMEOUT: return "TIMEOUT";
+        case VGPU_ERR_CUDA_ERROR: return "CUDA_ERROR";
+        case VGPU_ERR_INVALID_LENGTH: return "INVALID_LENGTH";
+        case VGPU_ERR_QUEUE_FULL: return "QUEUE_FULL";
+        case VGPU_ERR_RATE_LIMITED: return "RATE_LIMITED";
+        case VGPU_ERR_VM_QUARANTINED: return "VM_QUARANTINED";
+        case VGPU_ERR_UNSUPPORTED_OP: return "UNSUPPORTED_OP";
+        case VGPU_ERR_INVALID_POOL: return "INVALID_POOL";
+        default: return "UNKNOWN";
+    }
+}
 
 /* ---------------------------------------------------------------- */
 struct cuda_transport {
@@ -189,8 +421,12 @@ static int find_vgpu_device(char *res0_path, size_t res0_sz,
      * without going through cuda_transport_init() or cuda_transport_discover() */
     call_libvgpu_set_skip_interception(1);
     if (vgpu_debug_logging()) {
-        write(2, "[cuda-transport] FORCE: find_vgpu_device() STARTED - setting skip flag\n", 72);
-        write(2, "[cuda-transport] FORCE: Skip flag set to 1 in find_vgpu_device()\n", 65);
+        (void)syscall(__NR_write, 2,
+                      "[cuda-transport] FORCE: find_vgpu_device() STARTED - setting skip flag\n",
+                      sizeof("[cuda-transport] FORCE: find_vgpu_device() STARTED - setting skip flag\n") - 1);
+        (void)syscall(__NR_write, 2,
+                      "[cuda-transport] FORCE: Skip flag set to 1 in find_vgpu_device()\n",
+                      sizeof("[cuda-transport] FORCE: Skip flag set to 1 in find_vgpu_device()\n") - 1);
     }
     int device_count = 0;
     if (vgpu_debug_logging()) { fprintf(stderr, "[cuda-transport] DEBUG: Starting device scan...\n"); fflush(stderr); }
@@ -452,8 +688,10 @@ static int setup_shmem(cuda_transport_t *t)
     }
 
     if (st != STATUS_DONE) {
+        uint32_t err = REG32(t->bar0, REG_ERROR_CODE);
         fprintf(stderr, "[cuda-transport] vgpu-stub rejected shmem registration "
-                "(status=0x%02x) — using BAR1\n", st);
+                "(status=0x%02x err=0x%08x:%s) — using BAR1\n",
+                st, err, vgpu_err_to_str(err));
         /* Unregister */
         REG32(t->bar0, REG_SHMEM_CTRL) = 0;
         munlock(shmem, shmem_size);
@@ -482,7 +720,9 @@ static int setup_shmem(cuda_transport_t *t)
 int cuda_transport_init(cuda_transport_t **tp)
 {
     if (vgpu_debug_logging())
-        write(2, "[cuda-transport] FORCE: cuda_transport_init() STARTED\n", 54);
+        (void)syscall(__NR_write, 2,
+                      "[cuda-transport] FORCE: cuda_transport_init() STARTED\n",
+                      sizeof("[cuda-transport] FORCE: cuda_transport_init() STARTED\n") - 1);
     char res0_path[512], res1_path[512];
     char pci_bdf[64] = {0};
     cuda_transport_t *t;
@@ -492,23 +732,31 @@ int cuda_transport_init(cuda_transport_t **tp)
      * Same fix as in cuda_transport_discover() */
     call_libvgpu_set_skip_interception(1);
     if (vgpu_debug_logging()) {
-        write(2, "[cuda-transport] FORCE: About to set skip flag to 1\n", 52);
-        write(2, "[cuda-transport] FORCE: Skip flag SET to 1 (pid=", 48);
+        (void)syscall(__NR_write, 2,
+                      "[cuda-transport] FORCE: About to set skip flag to 1\n",
+                      sizeof("[cuda-transport] FORCE: About to set skip flag to 1\n") - 1);
+        (void)syscall(__NR_write, 2,
+                      "[cuda-transport] FORCE: Skip flag SET to 1 (pid=",
+                      sizeof("[cuda-transport] FORCE: Skip flag SET to 1 (pid=") - 1);
         char pid_str[32];
         snprintf(pid_str, sizeof(pid_str), "%d)\n", (int)getpid());
-        write(2, pid_str, strlen(pid_str));
+        (void)syscall(__NR_write, 2, pid_str, strlen(pid_str));
         fprintf(stderr, "[cuda-transport] DEBUG: cuda_transport_init() - Skip flag SET to 1 (pid=%d)\n", (int)getpid());
         fflush(stderr);
     }
 
+    cuda_transport_write_checkpoint("INIT_START");
     if (find_vgpu_device(res0_path, sizeof(res0_path),
                          res1_path, sizeof(res1_path),
                          pci_bdf,   sizeof(pci_bdf)) != 0) {
+        cuda_transport_write_error("DEVICE_NOT_FOUND", 0, 0,
+            "VGPU-STUB not in /sys/bus/pci/devices");
         fprintf(stderr, "[cuda-transport] VGPU-STUB device not found\n");
         /* Re-enable interception after discovery */
         call_libvgpu_set_skip_interception(0);
         return -1;
     }
+    cuda_transport_write_checkpoint("DEVICE_FOUND");
 
     t = (cuda_transport_t *)calloc(1, sizeof(cuda_transport_t));
     if (!t) return -1;
@@ -524,15 +772,22 @@ int cuda_transport_init(cuda_transport_t **tp)
     /* Map BAR0 (always required) */
     t->bar0_fd = open(res0_path, O_RDWR | O_SYNC);
     if (t->bar0_fd < 0) {
+        char errdetail[128];
+        snprintf(errdetail, sizeof(errdetail), "open(%s) %s", res0_path, strerror(errno));
+        cuda_transport_write_error("BAR0_OPEN_FAILED", 0, 0, errdetail);
         fprintf(stderr, "[cuda-transport] Cannot open BAR0: %s (%s)\n",
                 res0_path, strerror(errno));
         free(t);
         return -1;
     }
 
+    cuda_transport_write_checkpoint("BAR0_OPENED");
     t->bar0 = mmap(NULL, BAR0_SIZE, PROT_READ | PROT_WRITE,
                     MAP_SHARED, t->bar0_fd, 0);
     if (t->bar0 == MAP_FAILED) {
+        char errdetail[64];
+        snprintf(errdetail, sizeof(errdetail), "mmap BAR0 %s", strerror(errno));
+        cuda_transport_write_error("BAR0_MMAP_FAILED", 0, 0, errdetail);
         fprintf(stderr, "[cuda-transport] Cannot mmap BAR0: %s\n",
                 strerror(errno));
         close(t->bar0_fd);
@@ -564,6 +819,7 @@ int cuda_transport_init(cuda_transport_t **tp)
 
     /* Re-enable interception after successful discovery */
     call_libvgpu_set_skip_interception(0);
+    cuda_transport_write_checkpoint("TRANSPORT_READY");
     if (vgpu_debug_logging())
         fprintf(stderr, "[cuda-transport] Connected to VGPU-STUB "
                 "(vm_id=%u, data_path=%s)\n",
@@ -607,23 +863,58 @@ void cuda_transport_destroy(cuda_transport_t *tp)
  *
  * len MUST be <= the active window size (caller's responsibility).
  * ================================================================ */
+static void write_bar1_data_words(cuda_transport_t *tp,
+                                  const void *data, uint32_t len)
+{
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t off = 0;
+
+    while (off < len) {
+        uint64_t word = 0;
+        uint32_t chunk = len - off;
+        if (chunk > 8) chunk = 8;
+        memcpy(&word, src + off, chunk);
+        *(volatile uint64_t *)((volatile char *)tp->bar1 +
+                               BAR1_GUEST_TO_HOST_OFFSET + off) = word;
+        off += 8;
+    }
+}
+
 static void write_bulk_data(cuda_transport_t *tp,
+                            uint32_t call_id,
                             const void *data, uint32_t len)
 {
     if (len == 0 || !data) return;
 
-    if (tp->has_shmem) {
+    if (tp->has_shmem && len > CUDA_SMALL_DATA_MAX) {
         /* Zero-copy into guest-pinned shared memory */
         memcpy(tp->shmem_g2h, data, len);
     } else if (tp->has_bar1 && len > CUDA_SMALL_DATA_MAX) {
-        volatile uint8_t *dst = (volatile uint8_t *)tp->bar1
-                                + BAR1_GUEST_TO_HOST_OFFSET;
-        memcpy((void *)dst, data, len);
+        if (call_id == CUDA_CALL_MODULE_LOAD_DATA ||
+            call_id == CUDA_CALL_MODULE_LOAD_DATA_EX ||
+            call_id == CUDA_CALL_MODULE_LOAD_FAT_BINARY) {
+            /* Small module images are sensitive to widened MMIO stores. */
+            write_bar1_data_words(tp, data, len);
+        } else {
+            volatile uint8_t *dst = (volatile uint8_t *)tp->bar1
+                                    + BAR1_GUEST_TO_HOST_OFFSET;
+            memcpy((void *)dst, data, len);
+        }
     } else {
-        volatile uint8_t *dst = (volatile uint8_t *)tp->bar0
-                                + CUDA_REQ_DATA_OFFSET;
+        const uint8_t *src = (const uint8_t *)data;
         uint32_t to_copy = (len > CUDA_SMALL_DATA_MAX) ? CUDA_SMALL_DATA_MAX : len;
-        memcpy((void *)dst, data, to_copy);
+        uint32_t off = 0;
+
+        /* BAR0 inline data must be written as 32-bit MMIO stores. A plain
+         * memcpy() may issue wider stores that the stub does not preserve. */
+        while (off < to_copy) {
+            uint32_t word = 0;
+            uint32_t chunk = to_copy - off;
+            if (chunk > 4) chunk = 4;
+            memcpy(&word, src + off, chunk);
+            REG32(tp->bar0, CUDA_REQ_DATA_OFFSET + off) = word;
+            off += 4;
+        }
     }
 }
 
@@ -635,17 +926,24 @@ static void read_bulk_data(cuda_transport_t *tp,
 {
     if (len == 0 || !buf) return;
 
-    if (tp->has_shmem) {
+    if (tp->has_shmem && len > CUDA_SMALL_DATA_MAX) {
         memcpy(buf, tp->shmem_h2g, len);
     } else if (tp->has_bar1 && len > CUDA_SMALL_DATA_MAX) {
         volatile uint8_t *src = (volatile uint8_t *)tp->bar1
                                 + BAR1_HOST_TO_GUEST_OFFSET;
         memcpy(buf, (void *)src, len);
     } else {
-        volatile uint8_t *src = (volatile uint8_t *)tp->bar0
-                                + CUDA_RESP_DATA_OFFSET;
+        uint8_t *dst = (uint8_t *)buf;
         uint32_t to_copy = (len > CUDA_SMALL_DATA_MAX) ? CUDA_SMALL_DATA_MAX : len;
-        memcpy(buf, (void *)src, to_copy);
+        uint32_t off = 0;
+
+        while (off < to_copy) {
+            uint32_t word = REG32(tp->bar0, CUDA_RESP_DATA_OFFSET + off);
+            uint32_t chunk = to_copy - off;
+            if (chunk > 4) chunk = 4;
+            memcpy(dst + off, &word, chunk);
+            off += 4;
+        }
     }
 }
 
@@ -662,11 +960,38 @@ static uint32_t max_single_payload(cuda_transport_t *tp)
     return CUDA_SMALL_DATA_MAX;
 }
 
+/*
+ * Some platforms can post MMIO writes to BAR0/BAR1. Force a readback before
+ * the doorbell so the payload and metadata are visible to QEMU first.
+ */
+static inline void flush_cuda_request_writes(cuda_transport_t *tp, uint32_t send_len)
+{
+    __sync_synchronize();
+    if (send_len > 0 && send_len <= CUDA_SMALL_DATA_MAX) {
+        uint32_t tail_off = CUDA_REQ_DATA_OFFSET + ((send_len - 1u) & ~3u);
+        (void)REG32(tp->bar0, tail_off);
+    } else if (tp->has_bar1 && send_len > CUDA_SMALL_DATA_MAX) {
+        volatile uint32_t *tail =
+            (volatile uint32_t *)((volatile char *)tp->bar1 +
+                                  BAR1_GUEST_TO_HOST_OFFSET +
+                                  ((send_len - 1u) & ~3u));
+        (void)*tail;
+    } else if (tp->has_shmem && send_len > CUDA_SMALL_DATA_MAX) {
+        volatile uint8_t *tail =
+            (volatile uint8_t *)tp->shmem_g2h + (send_len - 1u);
+        (void)*tail;
+    }
+    (void)REG32(tp->bar0, REG_CUDA_DATA_LEN);
+    __sync_synchronize();
+}
+
 /* ================================================================
  * Core MMIO round-trip: write registers → ring doorbell → poll → read.
  *
  * send_len MUST fit in one pass (≤ max_single_payload()).
  * ================================================================ */
+static int g_first_call_done = 0;
+
 static int do_single_cuda_call(cuda_transport_t *tp,
                                uint32_t call_id,
                                const uint32_t *args, uint32_t num_args,
@@ -675,17 +1000,61 @@ static int do_single_cuda_call(cuda_transport_t *tp,
                                void *recv_data, uint32_t recv_cap,
                                uint32_t *recv_len)
 {
+    int log_module_payload = (call_id == CUDA_CALL_MODULE_LOAD_DATA ||
+                              call_id == CUDA_CALL_MODULE_LOAD_DATA_EX ||
+                              call_id == CUDA_CALL_MODULE_LOAD_FAT_BINARY) &&
+                             send_data && send_len > 0 &&
+                             vgpu_debug_logging();
+    if (!g_first_call_done) {
+        g_first_call_done = 1;
+        cuda_transport_write_checkpoint("FIRST_CALL");
+    }
     uint32_t seq = tp->seq_counter++;
     time_t start;
     uint32_t status;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+    }
 
     if (vgpu_debug_logging()) {
         fprintf(stderr, "[cuda-transport] SENDING to VGPU-STUB: call_id=0x%04x seq=%u args=%u data_len=%u (pid=%d)\n",
                 call_id, seq, num_args, send_len, (int)getpid());
         fflush(stderr);
     }
+    if (log_module_payload) {
+        const uint8_t *src = (const uint8_t *)send_data;
+        fprintf(stderr,
+                "[cuda-transport] MODULE_LOAD source seq=%u len=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x path=%s\n",
+                seq, send_len,
+                send_len > 0 ? src[0] : 0, send_len > 1 ? src[1] : 0,
+                send_len > 2 ? src[2] : 0, send_len > 3 ? src[3] : 0,
+                send_len > 4 ? src[4] : 0, send_len > 5 ? src[5] : 0,
+                send_len > 6 ? src[6] : 0, send_len > 7 ? src[7] : 0,
+                (tp->has_shmem && send_len > CUDA_SMALL_DATA_MAX) ? "shmem" :
+                (tp->has_bar1 && send_len > CUDA_SMALL_DATA_MAX ? "bar1" : "bar0"));
+        fflush(stderr);
+    }
     /* Write bulk data before writing metadata registers */
-    write_bulk_data(tp, send_data, send_len);
+    write_bulk_data(tp, call_id, send_data, send_len);
+    if (log_module_payload) {
+        const uint8_t *written = NULL;
+        if (tp->has_shmem && send_len > CUDA_SMALL_DATA_MAX) {
+            written = (const uint8_t *)tp->shmem_g2h;
+        } else if (tp->has_bar1 && send_len > CUDA_SMALL_DATA_MAX) {
+            written = (const uint8_t *)tp->bar1 + BAR1_GUEST_TO_HOST_OFFSET;
+        } else {
+            written = (const uint8_t *)tp->bar0 + CUDA_REQ_DATA_OFFSET;
+        }
+        fprintf(stderr,
+                "[cuda-transport] MODULE_LOAD written seq=%u len=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                seq, send_len,
+                send_len > 0 ? written[0] : 0, send_len > 1 ? written[1] : 0,
+                send_len > 2 ? written[2] : 0, send_len > 3 ? written[3] : 0,
+                send_len > 4 ? written[4] : 0, send_len > 5 ? written[5] : 0,
+                send_len > 6 ? written[6] : 0, send_len > 7 ? written[7] : 0);
+        fflush(stderr);
+    }
 
     /* Write call metadata */
     REG32(tp->bar0, REG_CUDA_OP)       = call_id;
@@ -698,10 +1067,23 @@ static int do_single_cuda_call(cuda_transport_t *tp,
     for (uint32_t i = 0; i < n; i++)
         REG32(tp->bar0, REG_CUDA_ARGS_BASE + i * 4) = args[i];
 
+    flush_cuda_request_writes(tp, send_len);
+
     if (vgpu_debug_logging()) {
         fprintf(stderr, "[cuda-transport] RINGING DOORBELL: MMIO write to VGPU-STUB (call_id=0x%04x, pid=%d)\n",
                 call_id, (int)getpid());
         fflush(stderr);
+    }
+    /* Lightweight trace: last line = last call sent before crash (for runner exit status 2 diagnosis) */
+    {
+        int tfd = (int)syscall(__NR_open, "/tmp/vgpu_call_sequence.log",
+                               O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (tfd >= 0) {
+            char tbuf[32];
+            int tn = snprintf(tbuf, sizeof(tbuf), "0x%04x %s\n", call_id, call_id_to_name(call_id));
+            if (tn > 0) (void)syscall(__NR_write, tfd, tbuf, (size_t)tn);
+            (void)syscall(__NR_close, tfd);
+        }
     }
     REG32(tp->bar0, REG_CUDA_DOORBELL) = 1;
 
@@ -710,14 +1092,42 @@ static int do_single_cuda_call(cuda_transport_t *tp,
     while (1) {
         status = REG32(tp->bar0, REG_STATUS);
         if (status == STATUS_DONE || status == STATUS_ERROR) break;
-        if (time(NULL) - start >= POLL_TIMEOUT_SEC) {
-            fprintf(stderr, "[cuda-transport] Timeout on call 0x%04x (seq=%u)\n",
-                    call_id, seq);
+        if (time(NULL) - start >= poll_timeout_sec()) {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "call_id=0x%04x seq=%u after %ds",
+                     call_id, seq, poll_timeout_sec());
+            debug_record_call(call_id, seq, 2, VGPU_ERR_TIMEOUT);
+            cuda_transport_write_error("TRANSPORT_TIMEOUT", call_id,
+                                       VGPU_ERR_TIMEOUT, detail);
+            fprintf(stderr, "[cuda-transport] Timeout on call 0x%04x (seq=%u) after %ds\n",
+                    call_id, seq, poll_timeout_sec());
             if (result) { memset(result, 0, sizeof(*result)); result->status = 2; }
             if (recv_len) *recv_len = 0;
             return 2;
         }
         usleep(POLL_INTERVAL_US);
+    }
+
+    /* BAR-level ERROR is authoritative; don't reinterpret stale CUDA result regs as success. */
+    if (status == STATUS_ERROR) {
+        uint32_t err = REG32(tp->bar0, REG_ERROR_CODE);
+        const char *err_name = vgpu_err_to_str(err);
+        char detail[128];
+        snprintf(detail, sizeof(detail), "seq=%u vm_id=%u %s", seq, tp->vm_id, err_name);
+        debug_record_call(call_id, seq, 2, err);
+        cuda_transport_write_error(err_name, call_id, err, detail);
+        fprintf(stderr,
+                "[cuda-transport] STATUS_ERROR: call_id=0x%04x seq=%u err=0x%08x(%s) vm_id=%u\n",
+                call_id, seq, err, err_name, tp->vm_id);
+        fflush(stderr);
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->magic = 0x56475055;
+            result->seq_num = seq;
+            result->status = 2; /* generic transport failure */
+        }
+        if (recv_len) *recv_len = 0;
+        return 2;
     }
 
     if (vgpu_debug_logging()) {
@@ -742,6 +1152,19 @@ static int do_single_cuda_call(cuda_transport_t *tp,
         if (nr > CUDA_MAX_INLINE_RESULTS) nr = CUDA_MAX_INLINE_RESULTS;
         for (uint32_t i = 0; i < nr; i++)
             result->results[i] = REG64(tp->bar0, REG_CUDA_RESULT_BASE + i * 8);
+        /* Host returned CUDA error — debug report for exact determination */
+        if (result->status != 0) {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "host_cuda_status=0x%x seq=%u",
+                     (unsigned)result->status, seq);
+            debug_record_call(call_id, seq, (int)result->status, (uint32_t)result->status);
+            cuda_transport_write_error("CUDA_CALL_FAILED", call_id,
+                                       result->status, detail);
+        } else {
+            debug_record_call(call_id, seq, 0, 0);
+        }
+    } else {
+        debug_record_call(call_id, seq, 0, 0);
     }
 
     /* Read bulk response */
@@ -794,7 +1217,17 @@ static int cuda_transport_call_htod_chunked(cuda_transport_t *tp,
         } else if (offset + chunk >= send_len) {
             chunk_args[14] = CUDA_CHUNK_FLAG_LAST;
         } else {
-            chunk_args[14] = 0;
+            chunk_args[14] = CUDA_CHUNK_FLAG_MIDDLE;
+        }
+
+        if (vgpu_debug_logging()) {
+            char msg[192];
+            int len = snprintf(msg, sizeof(msg),
+                               "[cuda-transport] HTOD chunk send offset=%u chunk=%u total=%u flags=0x%x limit=%u\n",
+                               offset, chunk, send_len, chunk_args[14], limit);
+            if (len > 0 && len < (int)sizeof(msg)) {
+                syscall(__NR_write, 2, msg, (size_t)len);
+            }
         }
 
         memset(&chunk_result, 0, sizeof(chunk_result));
@@ -896,6 +1329,14 @@ static int cuda_transport_call_module_load_chunked(
     int rc = 0;
     CUDACallResult chunk_result;
 
+    /* Keep small module images on conservative BAR0 chunking for correctness,
+     * but allow larger images to use the active high-throughput path. */
+    if (send_len <= (64u * 1024u)) {
+        limit = CUDA_SMALL_DATA_MAX;
+    } else if (limit < CUDA_SMALL_DATA_MAX) {
+        limit = CUDA_SMALL_DATA_MAX;
+    }
+
     while (offset < send_len) {
         uint32_t chunk = send_len - offset;
         if (chunk > limit) chunk = limit;
@@ -908,7 +1349,7 @@ static int cuda_transport_call_module_load_chunked(
         } else if (offset + chunk >= send_len) {
             chunk_args[14] = CUDA_CHUNK_FLAG_LAST;
         } else {
-            chunk_args[14] = 0;
+            chunk_args[14] = CUDA_CHUNK_FLAG_MIDDLE;
         }
 
         memset(&chunk_result, 0, sizeof(chunk_result));
@@ -943,6 +1384,7 @@ int cuda_transport_call(cuda_transport_t *tp,
                         void *recv_data, uint32_t recv_cap,
                         uint32_t *recv_len)
 {
+    pthread_mutex_lock(&g_transport_mutex);
     if (vgpu_debug_logging()) {
         char inv_msg[256];
         int inv_len = snprintf(inv_msg, sizeof(inv_msg),
@@ -960,20 +1402,25 @@ int cuda_transport_call(cuda_transport_t *tp,
             if (err_len > 0 && err_len < (int)sizeof(err_msg))
                 syscall(__NR_write, 2, err_msg, err_len);
         }
+        pthread_mutex_unlock(&g_transport_mutex);
         return 1;
     }
 
     uint32_t limit = max_single_payload(tp);
+    {
+    int rc;
 
     /* ---- Chunked host-to-device copy ---- */
     if ((call_id == CUDA_CALL_MEMCPY_HTOD ||
          call_id == CUDA_CALL_MEMCPY_HTOD_ASYNC) &&
         send_data && send_len > limit)
     {
-        return cuda_transport_call_htod_chunked(tp, call_id,
+        rc = cuda_transport_call_htod_chunked(tp, call_id,
                                                 args, num_args,
                                                 send_data, send_len,
                                                 result);
+        pthread_mutex_unlock(&g_transport_mutex);
+        return rc;
     }
 
     /* ---- Chunked device-to-host copy ---- */
@@ -981,30 +1428,37 @@ int cuda_transport_call(cuda_transport_t *tp,
          call_id == CUDA_CALL_MEMCPY_DTOH_ASYNC) &&
         recv_data && recv_cap > limit)
     {
-        return cuda_transport_call_dtoh_chunked(tp, call_id,
+        rc = cuda_transport_call_dtoh_chunked(tp, call_id,
                                                 args, num_args,
                                                 recv_data, recv_cap,
                                                 recv_len, result);
+        pthread_mutex_unlock(&g_transport_mutex);
+        return rc;
     }
 
     /* ---- Chunked module image upload ---- */
     if ((call_id == CUDA_CALL_MODULE_LOAD_DATA    ||
          call_id == CUDA_CALL_MODULE_LOAD_DATA_EX ||
          call_id == CUDA_CALL_MODULE_LOAD_FAT_BINARY) &&
-        send_data && send_len > limit)
+        send_data && send_len > CUDA_SMALL_DATA_MAX)
     {
-        return cuda_transport_call_module_load_chunked(tp, call_id,
+        rc = cuda_transport_call_module_load_chunked(tp, call_id,
                                                        send_data, send_len,
                                                        result);
+        pthread_mutex_unlock(&g_transport_mutex);
+        return rc;
     }
 
     /* ---- Normal single-call path ---- */
-    return do_single_cuda_call(tp, call_id,
-                               args, num_args,
-                               send_data, send_len,
-                               result,
-                               recv_data, recv_cap,
-                               recv_len);
+    rc = do_single_cuda_call(tp, call_id,
+                             args, num_args,
+                             send_data, send_len,
+                             result,
+                             recv_data, recv_cap,
+                             recv_len);
+    pthread_mutex_unlock(&g_transport_mutex);
+    return rc;
+    }
 }
 
 /* ================================================================

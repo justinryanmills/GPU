@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""
-Deploy phase3 guest shims to test-3 VM and get Ollama into GPU mode.
-
-Uses SCP for all file transfers (no chunked/base64) to avoid corruption.
-Reads VM target from vm_config.py (test-3@10.25.33.11).
-
-Steps:
-  1. SCP phase3 tree to VM (so 'make guest' works).
-  2. SSH: make guest in phase3.
-  3. Install built shims to /opt/vgpu/lib with correct symlinks.
-  4. Ensure Ollama systemd override (vgpu.conf) has LD_LIBRARY_PATH and OLLAMA_NUM_GPU.
-  5. Restart Ollama service.
-"""
+"""Deploy phase3 guest shims to VM via SCP; target from vm_config.py."""
 import os
 import sys
 import subprocess
@@ -26,7 +14,7 @@ USE_SSHPASS = shutil.which("sshpass") is not None
 
 
 def run_ssh(cmd, timeout_sec=300):
-    """Run command on VM via ssh. Uses sshpass if available, else connect_vm.py."""
+    """Run command on VM via ssh (sshpass or connect_vm.py)."""
     if USE_SSHPASS:
         full_cmd = [
             "sshpass", "-p", VM_PASSWORD,
@@ -44,7 +32,7 @@ def run_ssh(cmd, timeout_sec=300):
 
 
 def scp_file(local_path, remote_path, recursive=False):
-    """Copy file or directory to VM via scp (sshpass or pexpect). Returns True on success."""
+    """Copy file or directory to VM via scp."""
     dest = f"{VM_USER}@{VM_HOST}:{remote_path}"
     if USE_SSHPASS:
         full_cmd = [
@@ -62,14 +50,12 @@ def scp_file(local_path, remote_path, recursive=False):
         if recursive:
             scp_cmd += " -r"
         scp_cmd += " " + shlex.quote(local_path) + " " + shlex.quote(dest)
-        # Long timeout for full tree (600+ files, ~5MB)
         c = pexpect.spawn(scp_cmd, timeout=1200, encoding="utf-8")
         idx = c.expect(["password:", "Password:", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
         if idx in (0, 1):
             c.sendline(VM_PASSWORD)
         idx2 = c.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=1200)
         c.close()
-        # Success only if we got EOF (transfer finished), not TIMEOUT
         return idx2 == 0 and (c.exitstatus is None or c.exitstatus == 0)
     except Exception:
         return False
@@ -130,8 +116,6 @@ def main():
         return 1
     print("  Done.\n")
 
-    # 4) Ollama systemd override: run ollama.bin directly with full LD_PRELOAD (avoids SEGV when bash runs the script)
-    # Use custom ollama.service drop-in so ExecStart=ollama.bin serve and full LD_PRELOAD are set.
     override_dir = "/etc/systemd/system/ollama.service.d"
     vgpu_conf_local = os.path.join(SCRIPT_DIR, "ollama.service.d_vgpu.conf")
     print("Step 4: Installing ollama.service.d/vgpu.conf (ExecStart=ollama.bin, full LD_PRELOAD)...")

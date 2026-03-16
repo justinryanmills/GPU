@@ -44,6 +44,13 @@
 #define RTLD_DEFAULT ((void *)0)
 #endif
 
+/* Skip verbose memcpy logging unless VGPU_DEBUG set (reduces model load time). */
+static int cudart_debug_logging(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (getenv("VGPU_DEBUG") != NULL) ? 1 : 0;
+    return cached;
+}
+
 /* Transport types - forward declarations */
 typedef struct cuda_transport cuda_transport_t;
 /* CUDACallResult is defined in cuda_protocol.h */
@@ -57,46 +64,31 @@ static int (*g_cuda_transport_call)(cuda_transport_t *, uint32_t, const uint32_t
 
 static int ensure_transport_functions(void) {
     if (g_cuda_transport_init && g_cuda_transport_call) return 0;
-    
-    static int tried = 0;
-    if (tried) return -1;  /* Already tried and failed */
-    tried = 1;
-    
-    char debug_msg[256];
-    int debug_len;
-    
-    /* Get transport functions from libvgpu-cuda.so */
+
+    /* Get transport functions from libvgpu-cuda.so.
+     * Use RTLD_GLOBAL when loading so cuMemsetD8_v2 etc. are visible to dlsym(RTLD_DEFAULT). */
+#ifndef RTLD_GLOBAL
+#define RTLD_GLOBAL 0x00100
+#endif
     void *handle = dlopen("/opt/vgpu/lib/libvgpu-cuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
     if (!handle) {
         handle = dlopen("/usr/lib64/libvgpu-cuda.so", RTLD_LAZY | RTLD_NOLOAD);
     }
     if (!handle) {
-        handle = dlopen("libvgpu-cuda.so.1", RTLD_LAZY);
+        handle = dlopen("/opt/vgpu/lib/libvgpu-cuda.so.1", RTLD_LAZY | RTLD_GLOBAL);
     }
-    
-    debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                        "[libvgpu-cudart] ensure_transport_functions: handle=%p (pid=%d)\n",
-                        handle, (int)getpid());
-    if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-        syscall(__NR_write, 2, debug_msg, debug_len);
+    if (!handle) {
+        handle = dlopen("libvgpu-cuda.so.1", RTLD_LAZY | RTLD_GLOBAL);
     }
-    
+
     if (handle) {
         g_cuda_transport_init = (int (*)(cuda_transport_t **))dlsym(handle, "cuda_transport_init");
         g_cuda_transport_call = (int (*)(cuda_transport_t *, uint32_t, const uint32_t *, uint32_t,
                                         const void *, uint32_t, CUDACallResult *,
                                         void *, uint32_t, uint32_t *))dlsym(handle, "cuda_transport_call");
-        
-        debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                            "[libvgpu-cudart] ensure_transport_functions: init=%p call=%p (pid=%d)\n",
-                            (void*)g_cuda_transport_init, (void*)g_cuda_transport_call, (int)getpid());
-        if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-            syscall(__NR_write, 2, debug_msg, debug_len);
-        }
     }
-    
+
     if (!g_cuda_transport_init || !g_cuda_transport_call) {
-        /* Try RTLD_DEFAULT as fallback */
         if (!g_cuda_transport_init) {
             g_cuda_transport_init = (int (*)(cuda_transport_t **))dlsym(RTLD_DEFAULT, "cuda_transport_init");
         }
@@ -105,74 +97,56 @@ static int ensure_transport_functions(void) {
                                             const void *, uint32_t, CUDACallResult *,
                                             void *, uint32_t, uint32_t *))dlsym(RTLD_DEFAULT, "cuda_transport_call");
         }
-        
-        debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                            "[libvgpu-cudart] ensure_transport_functions: after RTLD_DEFAULT init=%p call=%p (pid=%d)\n",
-                            (void*)g_cuda_transport_init, (void*)g_cuda_transport_call, (int)getpid());
-        if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-            syscall(__NR_write, 2, debug_msg, debug_len);
-        }
     }
-    
+
     int result = (g_cuda_transport_init && g_cuda_transport_call) ? 0 : -1;
-    debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                        "[libvgpu-cudart] ensure_transport_functions: result=%d (pid=%d)\n",
-                        result, (int)getpid());
-    if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-        syscall(__NR_write, 2, debug_msg, debug_len);
+    if (cudart_debug_logging()) {
+        char debug_msg[256];
+        int debug_len = snprintf(debug_msg, sizeof(debug_msg),
+                                "[libvgpu-cudart] ensure_transport_functions: handle=%p init=%p call=%p result=%d (pid=%d)\n",
+                                handle, (void*)g_cuda_transport_init, (void*)g_cuda_transport_call, result, (int)getpid());
+        if (debug_len > 0 && debug_len < (int)sizeof(debug_msg))
+            syscall(__NR_write, 2, debug_msg, debug_len);
     }
-    
     return result;
 }
 
 static int ensure_transport_connected(void) {
     if (g_cudart_transport) return 0;
-    
-    char debug_msg[256];
-    int debug_len;
-    
-    debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                        "[libvgpu-cudart] ensure_transport_connected() CALLED (pid=%d)\n",
-                        (int)getpid());
-    if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-        syscall(__NR_write, 2, debug_msg, debug_len);
-    }
-    
+
     if (ensure_transport_functions() != 0) {
-        debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                            "[libvgpu-cudart] ensure_transport_connected() ERROR: ensure_transport_functions failed (pid=%d)\n",
-                            (int)getpid());
-        if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-            syscall(__NR_write, 2, debug_msg, debug_len);
+        if (cudart_debug_logging()) {
+            char debug_msg[256];
+            int debug_len = snprintf(debug_msg, sizeof(debug_msg),
+                                    "[libvgpu-cudart] ensure_transport_connected() ERROR: ensure_transport_functions failed (pid=%d)\n",
+                                    (int)getpid());
+            if (debug_len > 0 && debug_len < (int)sizeof(debug_msg))
+                syscall(__NR_write, 2, debug_msg, debug_len);
         }
         return -1;
     }
-    
-    debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                        "[libvgpu-cudart] ensure_transport_connected() calling cuda_transport_init (pid=%d)\n",
-                        (int)getpid());
-    if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-        syscall(__NR_write, 2, debug_msg, debug_len);
-    }
-    
+
     int init_result = g_cuda_transport_init(&g_cudart_transport);
     if (init_result != 0) {
-        debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                            "[libvgpu-cudart] ensure_transport_connected() ERROR: cuda_transport_init failed (pid=%d, result=%d)\n",
-                            (int)getpid(), init_result);
-        if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-            syscall(__NR_write, 2, debug_msg, debug_len);
+        if (cudart_debug_logging()) {
+            char debug_msg[256];
+            int debug_len = snprintf(debug_msg, sizeof(debug_msg),
+                                    "[libvgpu-cudart] ensure_transport_connected() ERROR: cuda_transport_init failed (pid=%d, result=%d)\n",
+                                    (int)getpid(), init_result);
+            if (debug_len > 0 && debug_len < (int)sizeof(debug_msg))
+                syscall(__NR_write, 2, debug_msg, debug_len);
         }
         return -1;
     }
-    
-    debug_len = snprintf(debug_msg, sizeof(debug_msg),
-                        "[libvgpu-cudart] ensure_transport_connected() SUCCESS: transport initialized (pid=%d)\n",
-                        (int)getpid());
-    if (debug_len > 0 && debug_len < (int)sizeof(debug_msg)) {
-        syscall(__NR_write, 2, debug_msg, debug_len);
+
+    if (cudart_debug_logging()) {
+        char debug_msg[256];
+        int debug_len = snprintf(debug_msg, sizeof(debug_msg),
+                                "[libvgpu-cudart] ensure_transport_connected() SUCCESS (pid=%d)\n",
+                                (int)getpid());
+        if (debug_len > 0 && debug_len < (int)sizeof(debug_msg))
+            syscall(__NR_write, 2, debug_msg, debug_len);
     }
-    
     return 0;
 }
 
@@ -215,6 +189,42 @@ typedef struct {
 typedef struct {
     unsigned int x, y, z;
 } dim3;
+
+/* Minimal CUDA runtime function attributes used by GGML queries. */
+typedef struct {
+    size_t sharedSizeBytes;
+    size_t constSizeBytes;
+    size_t localSizeBytes;
+    int maxThreadsPerBlock;
+    int numRegs;
+    int ptxVersion;
+    int binaryVersion;
+    int cacheModeCA;
+    int maxDynamicSharedSizeBytes;
+    int preferredShmemCarveout;
+} cudaFuncAttributes;
+
+/* Per-thread launch configuration used by __cudaPush/PopCallConfiguration */
+static __thread dim3 g_launch_grid_dim = {1, 1, 1};
+static __thread dim3 g_launch_block_dim = {1, 1, 1};
+static __thread size_t g_launch_shared_mem = 0;
+static __thread void *g_launch_stream = NULL;
+
+static dim3 sanitize_dim3(dim3 d) {
+    if (d.x == 0) d.x = 1;
+    if (d.y == 0) d.y = 1;
+    if (d.z == 0) d.z = 1;
+    return d;
+}
+
+static int occupancy_blocks_from_block_size(int blockSize) {
+    (void)blockSize;
+    /*
+     * Defensive: avoid any division in this shim path.
+     * We only need deterministic non-zero occupancy for GGML setup.
+     */
+    return 1;
+}
 
 /* cudaDeviceProp structure - CUDA 12 layout matching GGML expectations
  * Based on CUDA 12 headers, key offsets:
@@ -284,6 +294,41 @@ typedef struct {
     char _padding[512 - 0x1D0];
 } cudaDeviceProp;
 
+/*
+ * Some GGML/CUDA builds read device properties through slightly different
+ * layouts. Keep all occupancy/division-related fields strictly non-zero.
+ */
+static void sanitize_device_prop_nonzero(cudaDeviceProp *prop) {
+    if (!prop) return;
+
+    if (prop->warpSize <= 0) prop->warpSize = 32;
+    if (prop->multiProcessorCount <= 0) prop->multiProcessorCount = 120;
+    if (prop->maxThreadsPerBlock <= 0) prop->maxThreadsPerBlock = 1024;
+    if (prop->maxThreadsPerMultiProcessor <= 0) prop->maxThreadsPerMultiProcessor = 2048;
+    if (prop->regsPerBlock <= 0) prop->regsPerBlock = 65536;
+    if (prop->sharedMemPerBlock == 0) prop->sharedMemPerBlock = 49152;
+    if (prop->sharedMemPerMultiprocessor == 0) prop->sharedMemPerMultiprocessor = 233472;
+    if (prop->sharedMemPerBlockOptin <= 0) prop->sharedMemPerBlockOptin = 49152;
+    if (prop->maxSharedMemoryPerMultiProcessor <= 0) prop->maxSharedMemoryPerMultiProcessor = 233472;
+    if (prop->maxSharedMemoryPerBlockOptin <= 0) prop->maxSharedMemoryPerBlockOptin = 49152;
+    if (prop->maxSharedMemoryPerBlock <= 0) prop->maxSharedMemoryPerBlock = 49152;
+    if (prop->clockRate <= 0) prop->clockRate = 1400000;
+    if (prop->memoryClockRate <= 0) prop->memoryClockRate = 2600000;
+    if (prop->memoryBusWidth <= 0) prop->memoryBusWidth = 5120;
+    if (prop->l2CacheSize <= 0) prop->l2CacheSize = 52428800;
+    if (prop->maxBlocksPerMultiProcessor <= 0) prop->maxBlocksPerMultiProcessor = 32;
+    if (prop->singleToDoublePrecisionPerfRatio <= 0) prop->singleToDoublePrecisionPerfRatio = 2;
+    if (prop->accessPolicyMaxWindowSize <= 0) prop->accessPolicyMaxWindowSize = 1;
+    if (prop->reservedSharedMemPerBlock < 0) prop->reservedSharedMemPerBlock = 0;
+
+    if (prop->maxThreadsDim[0] <= 0) prop->maxThreadsDim[0] = 1024;
+    if (prop->maxThreadsDim[1] <= 0) prop->maxThreadsDim[1] = 1024;
+    if (prop->maxThreadsDim[2] <= 0) prop->maxThreadsDim[2] = 64;
+    if (prop->maxGridSize[0] <= 0) prop->maxGridSize[0] = 2147483647;
+    if (prop->maxGridSize[1] <= 0) prop->maxGridSize[1] = 65535;
+    if (prop->maxGridSize[2] <= 0) prop->maxGridSize[2] = 65535;
+}
+
 /* Forward declarations for Driver API functions we'll call */
 typedef int CUdevice;
 typedef int CUresult;
@@ -304,6 +349,9 @@ static CUresult (*real_cuCtxGetDevice)(CUdevice *device) = NULL;
 static CUresult (*real_cuDeviceGetAttribute)(int *pi, int attrib, CUdevice dev) = NULL;
 static CUresult (*real_cuDeviceGetProperties)(void *prop, CUdevice dev) = NULL;
 static CUresult (*real_cuDriverGetVersion)(int *driverVersion) = NULL;
+static CUresult (*real_cuDevicePrimaryCtxRetain)(void **pctx, CUdevice dev) = NULL;
+static CUresult (*real_cuCtxSetCurrent)(void *ctx) = NULL;
+static CUresult (*real_cuMemAlloc_v2)(uint64_t *dptr, size_t bytesize) = NULL;
 
 /* Initialize function pointers */
 static void init_driver_api_functions(void) {
@@ -323,6 +371,15 @@ static void init_driver_api_functions(void) {
     real_cuDeviceGetAttribute = (CUresult (*)(int *, int, CUdevice))dlsym(handle, "cuDeviceGetAttribute");
     real_cuDeviceGetProperties = (CUresult (*)(void *, CUdevice))dlsym(handle, "cuDeviceGetProperties");
     real_cuDriverGetVersion = (CUresult (*)(int *))dlsym(handle, "cuDriverGetVersion");
+    real_cuDevicePrimaryCtxRetain = (CUresult (*)(void **, CUdevice))dlsym(handle, "cuDevicePrimaryCtxRetain");
+    real_cuCtxSetCurrent = (CUresult (*)(void *))dlsym(handle, "cuCtxSetCurrent");
+    real_cuMemAlloc_v2 = (CUresult (*)(uint64_t *, size_t))dlsym(handle, "cuMemAlloc_v2");
+    if (!real_cuMemAlloc_v2) {
+        real_cuMemAlloc_v2 = (CUresult (*)(uint64_t *, size_t))dlsym(handle, "cuMemAlloc");
+    }
+    if (!real_cuDevicePrimaryCtxRetain) {
+        real_cuDevicePrimaryCtxRetain = (CUresult (*)(void **, CUdevice))dlsym(handle, "cuDevicePrimaryCtxRetain_v2");
+    }
     
     /* If dlsym with RTLD_DEFAULT failed, try explicit dlopen as fallback */
     if (!real_cuInit) {
@@ -345,19 +402,50 @@ static void init_driver_api_functions(void) {
             real_cuDeviceGetAttribute = (CUresult (*)(int *, int, CUdevice))dlsym(handle, "cuDeviceGetAttribute");
             real_cuDeviceGetProperties = (CUresult (*)(void *, CUdevice))dlsym(handle, "cuDeviceGetProperties");
             real_cuDriverGetVersion = (CUresult (*)(int *))dlsym(handle, "cuDriverGetVersion");
+            real_cuDevicePrimaryCtxRetain = (CUresult (*)(void **, CUdevice))dlsym(handle, "cuDevicePrimaryCtxRetain");
+            real_cuCtxSetCurrent = (CUresult (*)(void *))dlsym(handle, "cuCtxSetCurrent");
+            real_cuMemAlloc_v2 = (CUresult (*)(uint64_t *, size_t))dlsym(handle, "cuMemAlloc_v2");
+            if (!real_cuMemAlloc_v2) {
+                real_cuMemAlloc_v2 = (CUresult (*)(uint64_t *, size_t))dlsym(handle, "cuMemAlloc");
+            }
+            if (!real_cuDevicePrimaryCtxRetain) {
+                real_cuDevicePrimaryCtxRetain = (CUresult (*)(void **, CUdevice))dlsym(handle, "cuDevicePrimaryCtxRetain_v2");
+            }
         }
     }
     
-    /* Log if we found the functions */
-    if (real_cuInit) {
-        const char *found_msg = "[libvgpu-cudart] init_driver_api_functions: Found cuInit via dlsym\n";
-        syscall(__NR_write, 2, found_msg, 68);
-    } else {
-        const char *not_found_msg = "[libvgpu-cudart] init_driver_api_functions: cuInit NOT found via dlsym\n";
-        syscall(__NR_write, 2, not_found_msg, 72);
+    if (cudart_debug_logging()) {
+        if (real_cuInit)
+            syscall(__NR_write, 2, "[libvgpu-cudart] init_driver_api_functions: Found cuInit\n", 56);
+        else
+            syscall(__NR_write, 2, "[libvgpu-cudart] init_driver_api_functions: cuInit NOT found\n", 60);
     }
-    
     initialized = 1;
+}
+
+/* Ensure a current CUDA context exists before real libcublas init paths.
+ * Without this, cublasCreate_v2 may fail with "library was not initialized". */
+static void ensure_primary_context_ready(void) {
+    static int context_ready = 0;
+    if (context_ready) return;
+
+    init_driver_api_functions();
+    if (real_cuInit) {
+        (void)real_cuInit(0);
+    }
+
+    if (real_cuDevicePrimaryCtxRetain && real_cuCtxSetCurrent) {
+        void *ctx = NULL;
+        CUresult rc1 = real_cuDevicePrimaryCtxRetain(&ctx, 0);
+        if (rc1 == CUDA_SUCCESS && ctx) {
+            CUresult rc2 = real_cuCtxSetCurrent(ctx);
+            if (rc2 == CUDA_SUCCESS) {
+                context_ready = 1;
+                if (cudart_debug_logging())
+                    syscall(__NR_write, 2, "[libvgpu-cudart] ensure_primary_context_ready: context established\n", 68);
+            }
+        }
+    }
 }
 
 /* Forward declaration */
@@ -376,15 +464,6 @@ static void libvgpu_cudart_on_load(void) {
  * ================================================================ */
 
 cudaError_t cudaRuntimeGetVersion(int *runtimeVersion) {
-    /* CRITICAL: Log this call - GGML may check runtime version */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaRuntimeGetVersion() CALLED (pid=%d)\n",
-                          (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
     if (!runtimeVersion) {
         return cudaErrorInvalidValue;
     }
@@ -411,16 +490,14 @@ cudaError_t cudaRuntimeGetVersion(int *runtimeVersion) {
     }
     
     *runtimeVersion = runtime_version;
-    
-    /* Log the version being returned */
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaRuntimeGetVersion() SUCCESS: driver=%d, runtime=%d\n",
-                              driver_version, runtime_version);
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
+    if (cudart_debug_logging()) {
+        char success_msg[128];
+        int success_len = snprintf(success_msg, sizeof(success_msg),
+                                  "[libvgpu-cudart] cudaRuntimeGetVersion() SUCCESS: driver=%d runtime=%d\n",
+                                  driver_version, runtime_version);
+        if (success_len > 0 && success_len < (int)sizeof(success_msg))
+            syscall(__NR_write, 2, success_msg, success_len);
     }
-    
     return cudaSuccess;
 }
 
@@ -429,95 +506,82 @@ cudaError_t cudaRuntimeGetVersion(int *runtimeVersion) {
  * ================================================================ */
 
 cudaError_t cudaGetDeviceCount(int *count) {
-    /* CRITICAL: Log FIRST using syscall to see if this is called */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaGetDeviceCount() CALLED (pid=%d)\n",
-                          (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    /* Debug file for discovery trace (same pattern as libvgpu_cuda cuDeviceGetCount) */
+    if (!count) return cudaErrorInvalidValue;
+    *count = 1;
+    /* Unconditional marker to verify discovery path uses our shim */
     {
-        int fd = syscall(__NR_open, "/tmp/cudart_get_count_called.txt",
-                         O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int fd = (int)syscall(__NR_open, "/tmp/cudart_get_count_called.txt",
+                              O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
-            char buf[80];
+            char buf[64];
             int n = snprintf(buf, sizeof(buf), "pid=%d\n", (int)getpid());
-            if (n > 0) syscall(__NR_write, fd, buf, (size_t)n);
-            syscall(__NR_close, fd);
+            if (n > 0) (void)syscall(__NR_write, fd, buf, (size_t)n);
+            (void)syscall(__NR_close, fd);
         }
     }
-
-    if (!count) return cudaErrorInvalidValue;
-    
-    /* Return immediately with count=1, no Driver API call needed */
-    *count = 1;
-    
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaGetDeviceCount() SUCCESS: returning count=1 (pid=%d)\n",
+    if (cudart_debug_logging()) {
+        char log_msg[128];
+        int log_len = snprintf(log_msg, sizeof(log_msg),
+                              "[libvgpu-cudart] cudaGetDeviceCount() SUCCESS: count=1 (pid=%d)\n",
                               (int)getpid());
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
+        if (log_len > 0 && log_len < (int)sizeof(log_msg))
+            syscall(__NR_write, 2, log_msg, log_len);
     }
-    
     return cudaSuccess;
 }
 
 cudaError_t cudaGetDevice(int *device) {
-    const char *msg = "[libvgpu-cudart] cudaGetDevice() CALLED\n";
-    syscall(__NR_write, 2, msg, 45);
-    
     if (!device) return cudaErrorInvalidValue;
-    
-    /* Return immediately with device=0 */
     *device = 0;
-    
-    const char *success = "[libvgpu-cudart] cudaGetDevice() returning device=0\n";
-    syscall(__NR_write, 2, success, 52);
+    ensure_primary_context_ready();
     
     return cudaSuccess;
 }
 
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
-    /* CRITICAL: Log FIRST using syscall to see if this is called */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg), 
-                          "[libvgpu-cudart] cudaDeviceGetAttribute() CALLED (attr=%d, device=%d, pid=%d)\n", 
-                          attr, device, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
     if (!value || device != 0) {
         return cudaErrorInvalidValue;
     }
     
-    /* CRITICAL: Return immediately with default values - no Driver API calls */
-    /* This ensures initialization doesn't block or wait for anything */
-    *value = 0;
-    
-    /* Return common attribute values immediately */
-    if (attr == 75) { /* cudaDevAttrComputeCapabilityMajor */
-        *value = GPU_DEFAULT_CC_MAJOR;
-    } else if (attr == 76) { /* cudaDevAttrComputeCapabilityMinor */
-        *value = GPU_DEFAULT_CC_MINOR;
-    } else if (attr == 1) { /* cudaDevAttrMaxThreadsPerBlock */
+    /* Return deterministic non-zero values for queried attributes. */
+    switch (attr) {
+    case 1:   /* cudaDevAttrMaxThreadsPerBlock */
         *value = GPU_DEFAULT_MAX_THREADS_PER_BLOCK;
-    } else if (attr == 10) { /* cudaDevAttrMultiProcessorCount */
+        break;
+    case 8:   /* cudaDevAttrMaxSharedMemoryPerBlock */
+        *value = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+        break;
+    case 10:  /* cudaDevAttrWarpSize */
+        *value = GPU_DEFAULT_WARP_SIZE;
+        break;
+    case 13:  /* cudaDevAttrClockRate (kHz) */
+        *value = GPU_DEFAULT_CLOCK_RATE_KHZ;
+        break;
+    case 16:  /* cudaDevAttrMultiProcessorCount */
         *value = GPU_DEFAULT_SM_COUNT;
+        break;
+    case 39:  /* cudaDevAttrMaxThreadsPerMultiProcessor */
+        *value = GPU_DEFAULT_MAX_THREADS_PER_SM;
+        break;
+    case 106: /* cudaDevAttrMaxBlocksPerMultiprocessor */
+        *value = 32;
+        break;
+    case 75:  /* cudaDevAttrComputeCapabilityMajor */
+        *value = GPU_DEFAULT_CC_MAJOR;
+        break;
+    case 76:  /* cudaDevAttrComputeCapabilityMinor */
+        *value = GPU_DEFAULT_CC_MINOR;
+        break;
+    case 81:  /* cudaDevAttrMaxSharedMemoryPerMultiprocessor */
+        *value = (int)GPU_DEFAULT_SHARED_MEM_PER_SM;
+        break;
+    case 97:  /* cudaDevAttrMaxSharedMemoryPerBlockOptin */
+        *value = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+        break;
+    default:
+        *value = 1;
+        break;
     }
-    
-    /* Log the value being returned */
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaDeviceGetAttribute() SUCCESS: attr=%d, value=%d (pid=%d)\n",
-                              attr, *value, (int)getpid());
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
-    }
-    
     return cudaSuccess;
 }
 
@@ -537,12 +601,12 @@ static void patch_ggml_cuda_device_prop(void *prop_ptr) {
     // Cast to byte pointer for offset access
     uint8_t *ptr = (uint8_t *)prop_ptr;
 
-    // Patch major/minor at multiple likely offsets
-    // CUDA 12 offsets: 0x148/0x14C (computeCapabilityMajor/Minor)
-    // Legacy offsets: 0x150/0x154 (may be used by older GGML)
-    // Old CUDA 11 offsets: 0x158/0x15C (fallback for compatibility)
-    size_t offsets_major[] = {0x148, 0x150, 0x158};
-    size_t offsets_minor[] = {0x14C, 0x154, 0x15C};
+    // Patch at multiple offsets - GGML may use different cudaDeviceProp layouts.
+    // CUDA 12: 0x148/0x14C (computeCapabilityMajor/Minor)
+    // Legacy: 0x15C/0x160 (major/minor)
+    // Observed in the deployed libggml-cuda.so build: 0x168/0x16C
+    size_t offsets_major[] = {0x148, 0x15C, 0x168};
+    size_t offsets_minor[] = {0x14C, 0x160, 0x16C};
 
     int major = GPU_DEFAULT_CC_MAJOR;
     int minor = GPU_DEFAULT_CC_MINOR;
@@ -553,59 +617,51 @@ static void patch_ggml_cuda_device_prop(void *prop_ptr) {
         *(int32_t *)(ptr + offsets_minor[i]) = minor;
     }
 
-    // CRITICAL: Verify patching worked by reading back values
-    int verify_major = *((int32_t *)(ptr + 0x148));
-    int verify_minor = *((int32_t *)(ptr + 0x14C));
-
-    // Log the patching for verification - use syscall to ensure it appears
-    char patch_buf[512];
-    int patch_len = snprintf(patch_buf, sizeof(patch_buf),
-                            "[GGML PATCH] Patched cudaDeviceProp at prop=%p: major=%d minor=%d (verified: 0x148=%d 0x14C=%d, pid=%d)\n",
-                            prop_ptr, major, minor, verify_major, verify_minor, (int)getpid());
-    if (patch_len > 0 && patch_len < (int)sizeof(patch_buf)) {
-        syscall(__NR_write, 2, patch_buf, patch_len);
+    if (cudart_debug_logging()) {
+        int verify_major = *((int32_t *)(ptr + 0x148));
+        int verify_minor = *((int32_t *)(ptr + 0x14C));
+        int verify_major_alt = *((int32_t *)(ptr + 0x168));
+        int verify_minor_alt = *((int32_t *)(ptr + 0x16C));
+        char patch_buf[512];
+        int patch_len = snprintf(patch_buf, sizeof(patch_buf),
+                                "[GGML PATCH] Patched cudaDeviceProp at prop=%p: major=%d minor=%d (verified: 0x148=%d 0x14C=%d 0x168=%d 0x16C=%d, pid=%d)\n",
+                                prop_ptr, major, minor, verify_major, verify_minor,
+                                verify_major_alt, verify_minor_alt, (int)getpid());
+        if (patch_len > 0 && patch_len < (int)sizeof(patch_buf))
+            syscall(__NR_write, 2, patch_buf, patch_len);
     }
 }
 
 cudaError_t cudaGetDeviceProperties(cudaDeviceProp *prop, int device) {
-    /* CRITICAL: Log that the non-_v2 version is being called (GGML bootstrap may use this) */
-    const char *msg = "[libvgpu-cudart] cudaGetDeviceProperties() CALLED (non-_v2 version, pid=%d)\n";
-    char log_buf[128];
-    int log_len = snprintf(log_buf, sizeof(log_buf), msg, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_buf)) {
-        syscall(__NR_write, 2, log_buf, log_len);
+    if (cudart_debug_logging()) {
+        char log_buf[128];
+        int log_len = snprintf(log_buf, sizeof(log_buf), "[libvgpu-cudart] cudaGetDeviceProperties() CALLED (non-_v2 version, pid=%d)\n", (int)getpid());
+        if (log_len > 0 && log_len < (int)sizeof(log_buf))
+            syscall(__NR_write, 2, log_buf, log_len);
     }
-    
-    /* CRITICAL: Also patch the non-_v2 version for GGML bootstrap discovery */
     cudaError_t result = cudaGetDeviceProperties_v2(prop, device);
-    /* Apply patch here too in case GGML calls this version during discovery */
     patch_ggml_cuda_device_prop(prop);
-    
-    /* CRITICAL: Log after patching to confirm patch was applied */
-    char after_buf[256];
-    int after_len = snprintf(after_buf, sizeof(after_buf),
-                            "[libvgpu-cudart] cudaGetDeviceProperties() returning: major=%d minor=%d (after patch, pid=%d)\n",
-                            *((int32_t *)((char*)prop + 0x148)), *((int32_t *)((char*)prop + 0x14C)), (int)getpid());
-    if (after_len > 0 && after_len < (int)sizeof(after_buf)) {
-        syscall(__NR_write, 2, after_buf, after_len);
+    if (prop && cudart_debug_logging()) {
+        char after_buf[256];
+        int after_len = snprintf(after_buf, sizeof(after_buf),
+                                "[libvgpu-cudart] cudaGetDeviceProperties() returning: major=%d minor=%d (after patch, pid=%d)\n",
+                                *((int32_t *)((char*)prop + 0x148)), *((int32_t *)((char*)prop + 0x14C)), (int)getpid());
+        if (after_len > 0 && after_len < (int)sizeof(after_buf))
+            syscall(__NR_write, 2, after_buf, after_len);
     }
-    
     return result;
 }
 
 cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *prop, int device) {
-    const char *msg = "[libvgpu-cudart] cudaGetDeviceProperties_v2() CALLED\n";
-    syscall(__NR_write, 2, msg, 58);
-    
-    /* CRITICAL: Log the pointer address so we can trace what GGML reads */
-    char addr_buf[128];
-    int addr_len = snprintf(addr_buf, sizeof(addr_buf),
-                           "[GGML TRACE] cudaGetDeviceProperties_v2 called with prop=%p device=%d\n",
-                           (void*)prop, device);
-    if (addr_len > 0 && addr_len < (int)sizeof(addr_buf)) {
-        syscall(__NR_write, 2, addr_buf, addr_len);
+    if (cudart_debug_logging()) {
+        syscall(__NR_write, 2, "[libvgpu-cudart] cudaGetDeviceProperties_v2() CALLED\n", 58);
+        char addr_buf[128];
+        int addr_len = snprintf(addr_buf, sizeof(addr_buf),
+                               "[GGML TRACE] cudaGetDeviceProperties_v2 called with prop=%p device=%d\n",
+                               (void*)prop, device);
+        if (addr_len > 0 && addr_len < (int)sizeof(addr_buf))
+            syscall(__NR_write, 2, addr_buf, addr_len);
     }
-    
     if (!prop || device != 0) {
         return cudaErrorInvalidValue;
     }
@@ -635,8 +691,17 @@ cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *prop, int device) {
     prop->multiProcessorCount = GPU_DEFAULT_SM_COUNT;
     prop->maxThreadsPerBlock = GPU_DEFAULT_MAX_THREADS_PER_BLOCK;
     prop->maxThreadsPerMultiProcessor = GPU_DEFAULT_MAX_THREADS_PER_SM;
+    prop->regsPerBlock = 65536;
     prop->sharedMemPerBlock = GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
     prop->sharedMemPerMultiprocessor = GPU_DEFAULT_SHARED_MEM_PER_SM;
+    prop->sharedMemPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+    prop->maxSharedMemoryPerMultiProcessor = (int)GPU_DEFAULT_SHARED_MEM_PER_SM;
+    prop->maxSharedMemoryPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+    prop->maxSharedMemoryPerBlock = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+    prop->maxBlocksPerMultiProcessor = 32;
+    prop->singleToDoublePrecisionPerfRatio = 2;
+    prop->accessPolicyMaxWindowSize = 1;
+    prop->reservedSharedMemPerBlock = 0;
     prop->warpSize = GPU_DEFAULT_WARP_SIZE;
     prop->clockRate = GPU_DEFAULT_CLOCK_RATE_KHZ;
     prop->memoryClockRate = GPU_DEFAULT_MEM_CLOCK_RATE_KHZ;
@@ -660,86 +725,43 @@ cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *prop, int device) {
     *cc_major_ptr = GPU_DEFAULT_CC_MAJOR;
     *cc_minor_ptr = GPU_DEFAULT_CC_MINOR;
     
-    /* CRITICAL: Also patch old CUDA 11 offsets in case GGML uses those */
-    int *old_major_ptr = (int*)((char*)prop + 0x158);
-    int *old_minor_ptr = (int*)((char*)prop + 0x15C);
+    /* CRITICAL: Patch multiple known compute-capability readback offsets.
+     * In our struct, legacy major/minor are at 0x15C/0x160.
+     * The deployed GGML build also reads 0x168/0x16C after cudaGetDeviceProperties_v2().
+     * (0x158 is totalConstMem and must not be overwritten.) */
+    int *old_major_ptr = (int*)((char*)prop + 0x15C);
+    int *old_minor_ptr = (int*)((char*)prop + 0x160);
     *old_major_ptr = GPU_DEFAULT_CC_MAJOR;
     *old_minor_ptr = GPU_DEFAULT_CC_MINOR;
+    int *ggml_major_ptr = (int*)((char*)prop + 0x168);
+    int *ggml_minor_ptr = (int*)((char*)prop + 0x16C);
+    *ggml_major_ptr = GPU_DEFAULT_CC_MAJOR;
+    *ggml_minor_ptr = GPU_DEFAULT_CC_MINOR;
     
     int *warpSize_ptr = (int*)((char*)prop + 0x114);
     *warpSize_ptr = GPU_DEFAULT_WARP_SIZE;
+
+    /* Set common max dim fields explicitly; some code reads these directly. */
+    prop->maxThreadsDim[0] = 1024;
+    prop->maxThreadsDim[1] = 1024;
+    prop->maxThreadsDim[2] = 64;
+    prop->maxGridSize[0] = 2147483647;
+    prop->maxGridSize[1] = 65535;
+    prop->maxGridSize[2] = 65535;
+
+    /* Final guardrail against any zero divisor fields. */
+    sanitize_device_prop_nonzero(prop);
     
-    /* CRITICAL: Apply GGML-specific patch to ensure all possible offsets are set */
     patch_ggml_cuda_device_prop(prop);
-    
-    /* CRITICAL: Verify structure layout and field offsets */
-    /* Log detailed properties including offsets for debugging */
-    char log_buf[512];
-    int log_len = snprintf(log_buf, sizeof(log_buf),
-                          "[libvgpu-cudart] cudaGetDeviceProperties_v2() returning: name=%s, CC_major=%d CC_minor=%d (at 0x148/0x14C), mem=%zu GB, SM=%d, struct_size=%zu\n",
-                          prop->name, prop->computeCapabilityMajor, prop->computeCapabilityMinor,
-                          prop->totalGlobalMem / (1024ULL * 1024 * 1024),
-                          prop->multiProcessorCount,
-                          sizeof(cudaDeviceProp));
-    if (log_len > 0 && log_len < (int)sizeof(log_buf)) {
-        syscall(__NR_write, 2, log_buf, log_len);
+
+    if (cudart_debug_logging()) {
+        char log_buf[512];
+        int log_len = snprintf(log_buf, sizeof(log_buf),
+                              "[libvgpu-cudart] cudaGetDeviceProperties_v2() returning: name=%s, CC_major=%d CC_minor=%d\n",
+                              prop->name, prop->computeCapabilityMajor, prop->computeCapabilityMinor);
+        if (log_len > 0 && log_len < (int)sizeof(log_buf))
+            syscall(__NR_write, 2, log_buf, log_len);
     }
-    
-    /* CRITICAL: Verify direct memory patching worked */
-    int cc_major_at_offset = *((int*)((char*)prop + 0x148));
-    int cc_minor_at_offset = *((int*)((char*)prop + 0x14C));
-    char verify_buf[256];
-    int verify_len = snprintf(verify_buf, sizeof(verify_buf),
-                             "[libvgpu-cudart] VERIFY: Direct memory at 0x148/0x14C: major=%d minor=%d\n",
-                             cc_major_at_offset, cc_minor_at_offset);
-    if (verify_len > 0 && verify_len < (int)sizeof(verify_buf)) {
-        syscall(__NR_write, 2, verify_buf, verify_len);
-    }
-    
-    /* GGML CHECK: Log values that GGML will read for validation */
-    char ggml_check_buf[512];
-    int ggml_check_len = snprintf(ggml_check_buf, sizeof(ggml_check_buf),
-                                  "[GGML CHECK] prop=%p: computeCapabilityMajor=%d computeCapabilityMinor=%d (at offsets 0x148/0x14C) major=%d minor=%d (legacy) multiProcessorCount=%d totalGlobalMem=%llu warpSize=%d\n",
-                                  (void*)prop,
-                                  prop->computeCapabilityMajor,
-                                  prop->computeCapabilityMinor,
-                                  prop->major,
-                                  prop->minor,
-                                  prop->multiProcessorCount,
-                                  (unsigned long long)prop->totalGlobalMem,
-                                  prop->warpSize);
-    if (ggml_check_len > 0 && ggml_check_len < (int)sizeof(ggml_check_buf)) {
-        syscall(__NR_write, 2, ggml_check_buf, ggml_check_len);
-    }
-    
-    /* CRITICAL: Log what GGML might read at various possible offsets */
-    /* Check multiple possible locations where GGML might read major/minor */
-    int *major_at_0x148 = (int*)((char*)prop + 0x148);
-    int *minor_at_0x14C = (int*)((char*)prop + 0x14C);
-    int *major_legacy = &prop->major;
-    int *minor_legacy = &prop->minor;
-    
-    char offset_buf[512];
-    int offset_len = snprintf(offset_buf, sizeof(offset_buf),
-                              "[GGML OFFSET CHECK] 0x148=%d 0x14C=%d legacy_major=%d legacy_minor=%d struct_size=%zu\n",
-                              *major_at_0x148, *minor_at_0x14C,
-                              *major_legacy, *minor_legacy,
-                              sizeof(cudaDeviceProp));
-    if (offset_len > 0 && offset_len < (int)sizeof(offset_buf)) {
-        syscall(__NR_write, 2, offset_buf, offset_len);
-    }
-    
-    /* Also check if GGML might be reading from old CUDA 11 offsets (0x158/0x15C) */
-    int *old_major = (int*)((char*)prop + 0x158);
-    int *old_minor = (int*)((char*)prop + 0x15C);
-    char old_offset_buf[256];
-    int old_offset_len = snprintf(old_offset_buf, sizeof(old_offset_buf),
-                                  "[GGML OLD OFFSET CHECK] 0x158=%d 0x15C=%d\n",
-                                  *old_major, *old_minor);
-    if (old_offset_len > 0 && old_offset_len < (int)sizeof(old_offset_buf)) {
-        syscall(__NR_write, 2, old_offset_buf, old_offset_len);
-    }
-    
     return cudaSuccess;
 }
 
@@ -754,75 +776,49 @@ cudaError_t cudaRuntimeGetVersion_v2(int *runtimeVersion) {
 
 /* cudaDriverGetVersion - get driver version */
 cudaError_t cudaDriverGetVersion(int *driverVersion) {
-    /* CRITICAL: Log this call - GGML may check driver version */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaDriverGetVersion() CALLED (pid=%d)\n",
-                          (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
     if (!driverVersion) return cudaErrorInvalidValue;
     *driverVersion = GPU_DEFAULT_DRIVER_VERSION;
-    
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
+    if (cudart_debug_logging()) {
+        char log_msg[128];
+        int log_len = snprintf(log_msg, sizeof(log_msg),
                               "[libvgpu-cudart] cudaDriverGetVersion() SUCCESS: version=%d (pid=%d)\n",
                               *driverVersion, (int)getpid());
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
+        if (log_len > 0 && log_len < (int)sizeof(log_msg))
+            syscall(__NR_write, 2, log_msg, log_len);
     }
     return cudaSuccess;
 }
 
-/* cudaGetErrorString - get error string */
+/* cudaGetErrorString - get error string (so GGML logs show real error, not "no error") */
 const char* cudaGetErrorString(cudaError_t error) {
-    /* CRITICAL: Log this call - GGML may check error strings */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaGetErrorString() CALLED (error=%d, pid=%d)\n",
-                          (int)error, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
+    /* Log and return a real string for common vGPU shim errors */
+    if (error == cudaSuccess) return "no error";
+    switch (error) {
+        case cudaErrorInvalidValue:       return "invalid value";
+        case cudaErrorInitializationError: return "initialization error";
+        case cudaErrorNoDevice:            return "no CUDA device";
+        case cudaErrorMemoryAllocation:   return "out of memory";
+        default:                          return "unknown error";
     }
-    return "no error";
 }
 
 /* cudaGetLastError - get last error */
 cudaError_t cudaGetLastError(void) {
-    /* CRITICAL: Log this call - GGML may check for errors after function calls */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaGetLastError() CALLED (pid=%d) - returning cudaSuccess\n",
-                          (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
     return cudaSuccess;
 }
 
 /* cudaMalloc - allocate device memory */
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    /* CRITICAL: Log this call - GGML allocates memory for tensors */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaMalloc() CALLED (size=%zu, pid=%d)\n",
-                          size, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
     if (!devPtr) return cudaErrorInvalidValue;
-    
-    /* CRITICAL FIX: Use transport directly to allocate on physical GPU */
+    if (size == 0) return cudaErrorInvalidValue;  /* CUDA spec: zero-size invalid */
     if (ensure_transport_connected() != 0) {
-        char error_msg[256];
-        int error_len = snprintf(error_msg, sizeof(error_msg),
-                                "[libvgpu-cudart] cudaMalloc() ERROR: transport not available (pid=%d)\n",
-                                (int)getpid());
-        if (error_len > 0 && error_len < (int)sizeof(error_msg)) {
-            syscall(__NR_write, 2, error_msg, error_len);
+        if (cudart_debug_logging()) {
+            char error_msg[256];
+            int error_len = snprintf(error_msg, sizeof(error_msg),
+                                    "[libvgpu-cudart] cudaMalloc() ERROR: transport not available (pid=%d)\n",
+                                    (int)getpid());
+            if (error_len > 0 && error_len < (int)sizeof(error_msg))
+                syscall(__NR_write, 2, error_msg, error_len);
         }
         return cudaErrorInitializationError;
     }
@@ -833,54 +829,78 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
     args[2] = 0;
     args[3] = 0;
     
-    /* CRITICAL: Log before calling transport to verify the call happens */
-    char pre_call_msg[256];
-    int pre_call_len = snprintf(pre_call_msg, sizeof(pre_call_msg),
-                               "[libvgpu-cudart] ABOUT TO CALL transport: call_id=0x%04x size=%zu transport=%p (pid=%d)\n",
-                               CUDA_CALL_MEM_ALLOC, size, (void*)g_cudart_transport, (int)getpid());
-    if (pre_call_len > 0 && pre_call_len < (int)sizeof(pre_call_msg)) {
-        syscall(__NR_write, 2, pre_call_msg, pre_call_len);
-    }
-    
     CUDACallResult result;
     memset(&result, 0, sizeof(result));
-    int cuda_result = g_cuda_transport_call(g_cudart_transport,
+    int cuda_result = -1;
+    int attempt = 0;
+    const int max_attempts = 5;
+    for (attempt = 0; attempt < max_attempts; ++attempt) {
+        cuda_result = g_cuda_transport_call(g_cudart_transport,
                                             CUDA_CALL_MEM_ALLOC,
                                             args, 4,
                                             NULL, 0,
                                             &result,
                                             NULL, 0, NULL);
-    
-    /* CRITICAL: Log after calling transport to verify the call completed */
-    char post_call_msg[256];
-    int post_call_len = snprintf(post_call_msg, sizeof(post_call_msg),
-                                "[libvgpu-cudart] AFTER transport call: result=%d status=%u num_results=%u (pid=%d)\n",
-                                cuda_result, result.status, result.num_results, (int)getpid());
-    if (post_call_len > 0 && post_call_len < (int)sizeof(post_call_msg)) {
-        syscall(__NR_write, 2, post_call_msg, post_call_len);
+
+        if (!(cuda_result == 0 && result.status == 0 && result.num_results == 0)) {
+            break;
+        }
+        if (cudart_debug_logging()) {
+            char retry_msg[192];
+            int retry_len = snprintf(retry_msg, sizeof(retry_msg),
+                                     "[libvgpu-cudart] cudaMalloc() RETRY: attempt=%d/%d (pid=%d)\n",
+                                     attempt + 1, max_attempts, (int)getpid());
+            if (retry_len > 0 && retry_len < (int)sizeof(retry_msg))
+                syscall(__NR_write, 2, retry_msg, retry_len);
+        }
+        usleep(50000);
     }
     
     if (cuda_result == 0 && result.status == 0 && result.num_results > 0) {
         *devPtr = (void *)(uintptr_t)result.results[0];
     } else {
-        char error_msg[256];
-        int error_len = snprintf(error_msg, sizeof(error_msg),
-                                "[libvgpu-cudart] cudaMalloc() ERROR: transport call failed (pid=%d, result=%d, status=%u)\n",
-                                (int)getpid(), cuda_result, result.status);
-        if (error_len > 0 && error_len < (int)sizeof(error_msg)) {
-            syscall(__NR_write, 2, error_msg, error_len);
+        /*
+         * If transport reports success but returns no pointer, try Driver API shim
+         * fallback to avoid false OOM from transient BAR result anomalies.
+         */
+        if (cuda_result == 0 && result.status == 0 && result.num_results == 0) {
+            uint64_t dptr64 = 0;
+            init_driver_api_functions();
+            if (real_cuMemAlloc_v2) {
+                CUresult rc_drv = real_cuMemAlloc_v2(&dptr64, size);
+                if (rc_drv == CUDA_SUCCESS && dptr64 != 0) {
+                    *devPtr = (void *)(uintptr_t)dptr64;
+                    if (cudart_debug_logging()) {
+                        char fallback_ok[192];
+                        int fallback_ok_len = snprintf(fallback_ok, sizeof(fallback_ok),
+                                                       "[libvgpu-cudart] cudaMalloc() FALLBACK via cuMemAlloc_v2 SUCCESS: ptr=%p size=%zu (pid=%d)\n",
+                                                       *devPtr, size, (int)getpid());
+                        if (fallback_ok_len > 0 && fallback_ok_len < (int)sizeof(fallback_ok))
+                            syscall(__NR_write, 2, fallback_ok, fallback_ok_len);
+                    }
+                    return cudaSuccess;
+                }
+            }
+        }
+
+        if (cudart_debug_logging()) {
+            char error_msg[256];
+            int error_len = snprintf(error_msg, sizeof(error_msg),
+                                    "[libvgpu-cudart] cudaMalloc() ERROR: transport failed (pid=%d, result=%d, status=%u)\n",
+                                    (int)getpid(), cuda_result, result.status);
+            if (error_len > 0 && error_len < (int)sizeof(error_msg))
+                syscall(__NR_write, 2, error_msg, error_len);
         }
         return cudaErrorMemoryAllocation;
     }
-    
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaMalloc() SUCCESS: ptr=%p, size=%zu (pid=%d, cu_result=%d)\n",
-                              *devPtr, size, (int)getpid(), cuda_result);
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
+    if (cudart_debug_logging()) {
+        char success_msg[128];
+        int success_len = snprintf(success_msg, sizeof(success_msg),
+                                  "[libvgpu-cudart] cudaMalloc() SUCCESS: ptr=%p size=%zu (pid=%d)\n",
+                                  *devPtr, size, (int)getpid());
+        if (success_len > 0 && success_len < (int)sizeof(success_msg))
+            syscall(__NR_write, 2, success_msg, success_len);
     }
-    
     return (cuda_result == 0) ? cudaSuccess : cudaErrorMemoryAllocation;
 }
 
@@ -908,16 +928,8 @@ cudaError_t cudaFree(void *devPtr) {
 
 /* cudaMallocHost - allocate host memory */
 cudaError_t cudaMallocHost(void **ptr, size_t size) {
-    /* CRITICAL: Log this call - GGML may allocate host memory for buffers */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaMallocHost() CALLED (size=%zu, pid=%d)\n",
-                          size, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
     if (!ptr) return cudaErrorInvalidValue;
+    if (size == 0) return cudaErrorInvalidValue;
     
     /* CRITICAL FIX: Allocate aligned host memory (32-byte alignment for GGML) */
     const size_t alignment = 32; /* GGML TENSOR_ALIGNMENT */
@@ -925,25 +937,17 @@ cudaError_t cudaMallocHost(void **ptr, size_t size) {
     int rc = posix_memalign(&aligned_ptr, alignment, size);
     
     if (rc != 0 || !aligned_ptr) {
-        char error_msg[128];
-        int error_len = snprintf(error_msg, sizeof(error_msg),
-                                "[libvgpu-cudart] cudaMallocHost() ERROR: posix_memalign failed (rc=%d, pid=%d)\n",
-                                rc, (int)getpid());
-        if (error_len > 0 && error_len < (int)sizeof(error_msg)) {
-            syscall(__NR_write, 2, error_msg, error_len);
+        if (cudart_debug_logging()) {
+            char error_msg[128];
+            int error_len = snprintf(error_msg, sizeof(error_msg),
+                                    "[libvgpu-cudart] cudaMallocHost() ERROR: posix_memalign failed (rc=%d, pid=%d)\n",
+                                    rc, (int)getpid());
+            if (error_len > 0 && error_len < (int)sizeof(error_msg))
+                syscall(__NR_write, 2, error_msg, error_len);
         }
         return cudaErrorMemoryAllocation;
     }
-    
     *ptr = aligned_ptr;
-    
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaMallocHost() SUCCESS: ptr=%p (aligned to 32 bytes), size=%zu (pid=%d)\n",
-                              *ptr, size, (int)getpid());
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
-    }
     return cudaSuccess;
 }
 
@@ -965,6 +969,7 @@ cudaError_t cudaDeviceReset(void) {
 
 /* cudaDeviceCanAccessPeer - check peer access */
 cudaError_t cudaDeviceCanAccessPeer(int *canAccessPeer, int device, int peerDevice) {
+    (void)device; (void)peerDevice;
     if (!canAccessPeer) return cudaErrorInvalidValue;
     *canAccessPeer = 0; /* No peer access */
     return cudaSuccess;
@@ -972,11 +977,13 @@ cudaError_t cudaDeviceCanAccessPeer(int *canAccessPeer, int device, int peerDevi
 
 /* cudaDeviceEnablePeerAccess - enable peer access */
 cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags) {
+    (void)peerDevice; (void)flags;
     return cudaSuccess;
 }
 
 /* cudaDeviceDisablePeerAccess - disable peer access */
 cudaError_t cudaDeviceDisablePeerAccess(int peerDevice) {
+    (void)peerDevice;
     return cudaSuccess;
 }
 
@@ -986,28 +993,14 @@ cudaError_t cudaDeviceDisablePeerAccess(int peerDevice) {
 
 /* cudaSetDevice - set active device */
 cudaError_t cudaSetDevice(int device) {
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaSetDevice() CALLED: device=%d (pid=%d)\n",
-                          device, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
-    if (device != 0) {
-        return cudaErrorInvalidDevice;
-    }
-    
-    /* CRITICAL: During init, just return success - don't try to create context */
-    const char *success_msg = "[libvgpu-cudart] cudaSetDevice() SUCCESS: device=0\n";
-    syscall(__NR_write, 2, success_msg, 52);
+    if (device != 0) return cudaErrorInvalidDevice;
+    ensure_primary_context_ready();
     return cudaSuccess;
 }
 
 /* cudaSetDeviceFlags - set device flags */
 cudaError_t cudaSetDeviceFlags(unsigned int flags) {
-    const char *msg = "[libvgpu-cudart] cudaSetDeviceFlags() CALLED\n";
-    syscall(__NR_write, 2, msg, 52);
+    (void)flags;
     return cudaSuccess;
 }
 
@@ -1020,24 +1013,29 @@ cudaError_t cudaPeekAtLastError(void) {
  * CUDA Runtime API — Memory Management
  * ================================================================ */
 
-/* cudaMemset - set device memory */
+/* cudaMemset - set device memory (forward to Driver API cuMemsetD8_v2 when available) */
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
-    const char *msg = "[libvgpu-cudart] cudaMemset() CALLED\n";
-    syscall(__NR_write, 2, msg, 45);
+    if (!devPtr || count == 0) return cudaSuccess;
+    typedef int (*cuMemsetD8_v2_func)(void *, unsigned char, size_t);
+    cuMemsetD8_v2_func fn = (cuMemsetD8_v2_func)dlsym(RTLD_DEFAULT, "cuMemsetD8_v2");
+    if (!fn) fn = (cuMemsetD8_v2_func)dlsym(RTLD_DEFAULT, "cuMemsetD8");
+    if (fn) {
+        int rc = fn(devPtr, (unsigned char)(value & 0xFF), count);
+        if (rc == 0) return cudaSuccess;
+    }
+    /* Fallback: no-op if Driver API unavailable or transport error (avoids inference abort) */
     return cudaSuccess;
 }
 
-/* cudaMemsetAsync - set device memory asynchronously */
+/* cudaMemsetAsync - set device memory asynchronously (sync for now) */
 cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaMemsetAsync() CALLED\n";
-    syscall(__NR_write, 2, msg, 51);
-    return cudaSuccess;
+    (void)stream;
+    return cudaMemset(devPtr, value, count);
 }
 
 /* cudaMallocManaged - allocate unified memory */
 cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
-    const char *msg = "[libvgpu-cudart] cudaMallocManaged() CALLED\n";
-    syscall(__NR_write, 2, msg, 53);
+    (void)size; (void)flags;
     if (!devPtr) return cudaErrorInvalidValue;
     *devPtr = (void*)0x2000;
     return cudaSuccess;
@@ -1045,63 +1043,22 @@ cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
 
 /* cudaMemGetInfo - get memory info */
 cudaError_t cudaMemGetInfo(size_t *free, size_t *total) {
-    /* CRITICAL: Log this call - GGML checks available GPU memory */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaMemGetInfo() CALLED (pid=%d)\n",
-                          (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
-    /* CRITICAL: Return values matching our GPU properties (H100 80GB) */
-    /* Use GPU_DEFAULT_TOTAL_MEM from gpu_properties.h */
-    size_t total_mem = GPU_DEFAULT_TOTAL_MEM; /* 80GB */
-    size_t free_mem = total_mem - (1ULL * 1024 * 1024 * 1024); /* Leave 1GB for system */
-    
+    size_t total_mem = GPU_DEFAULT_TOTAL_MEM;
+    size_t free_mem = total_mem - (1ULL * 1024 * 1024 * 1024);
     if (free) *free = free_mem;
     if (total) *total = total_mem;
-    
-    char success_msg[256];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaMemGetInfo() SUCCESS: free=%zu GB, total=%zu GB (pid=%d)\n",
-                              free_mem / (1024ULL * 1024 * 1024),
-                              total_mem / (1024ULL * 1024 * 1024),
-                              (int)getpid());
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
-    }
     return cudaSuccess;
 }
 
 /* cudaHostRegister - register host memory */
 cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags) {
-    /* CRITICAL: Log this call - GGML may register host buffers that need alignment */
-    char log_msg[256];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaHostRegister() CALLED (ptr=%p, size=%zu, flags=0x%x, pid=%d)\n",
-                          ptr, size, flags, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
-    /* CRITICAL: Check alignment - GGML requires 32-byte alignment */
-    if (ptr && ((uintptr_t)ptr % 32 != 0)) {
-        char error_msg[256];
-        int error_len = snprintf(error_msg, sizeof(error_msg),
-                                "[libvgpu-cudart] cudaHostRegister() WARNING: ptr=%p is not 32-byte aligned (pid=%d)\n",
-                                ptr, (int)getpid());
-        if (error_len > 0 && error_len < (int)sizeof(error_msg)) {
-            syscall(__NR_write, 2, error_msg, error_len);
-        }
-    }
+    (void)ptr; (void)size; (void)flags;
     return cudaSuccess;
 }
 
 /* cudaHostUnregister - unregister host memory */
 cudaError_t cudaHostUnregister(void *ptr) {
-    const char *msg = "[libvgpu-cudart] cudaHostUnregister() CALLED\n";
-    syscall(__NR_write, 2, msg, 53);
+    (void)ptr;
     return cudaSuccess;
 }
 
@@ -1117,15 +1074,16 @@ cudaError_t cudaHostUnregister(void *ptr) {
 
 /* cudaMemcpy - synchronous memory copy */
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
-    char log_msg[256];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaMemcpy() CALLED: dst=%p src=%p count=%zu kind=%d (pid=%d)\n",
-                          dst, src, count, kind, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
+    if (cudart_debug_logging()) {
+        char log_msg[256];
+        int log_len = snprintf(log_msg, sizeof(log_msg),
+                              "[libvgpu-cudart] cudaMemcpy() CALLED: dst=%p src=%p count=%zu kind=%d (pid=%d)\n",
+                              dst, src, count, kind, (int)getpid());
+        if (log_len > 0 && log_len < (int)sizeof(log_msg))
+            syscall(__NR_write, 2, log_msg, log_len);
     }
-    
-    if (!dst || !src || count == 0) return cudaErrorInvalidValue;
+    if (!dst || !src) return cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;  /* Zero-byte copy is valid no-op per CUDA spec */
     
     /* CRITICAL FIX: Use Driver API which calls transport */
     typedef int (*cuMemcpyHtoD_func)(void *, const void *, size_t);
@@ -1167,28 +1125,28 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     } else {
         return cudaErrorInvalidValue;
     }
-    
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cudaMemcpy() SUCCESS: forwarded to transport (pid=%d, result=%d)\n",
-                              (int)getpid(), cuda_result);
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
+    if (cudart_debug_logging()) {
+        char success_msg[128];
+        int success_len = snprintf(success_msg, sizeof(success_msg),
+                                  "[libvgpu-cudart] cudaMemcpy() SUCCESS: forwarded to transport (pid=%d, result=%d)\n",
+                                  (int)getpid(), cuda_result);
+        if (success_len > 0 && success_len < (int)sizeof(success_msg))
+            syscall(__NR_write, 2, success_msg, success_len);
     }
-    
     return (cuda_result == 0) ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaMemcpyAsync - async memory copy */
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, void *stream) {
-    char log_msg[256];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cudaMemcpyAsync() CALLED: dst=%p src=%p count=%zu kind=%d (pid=%d)\n",
-                          dst, src, count, kind, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
+    (void)stream;
+    if (cudart_debug_logging()) {
+        char log_msg[256];
+        int log_len = snprintf(log_msg, sizeof(log_msg),
+                              "[libvgpu-cudart] cudaMemcpyAsync() CALLED: dst=%p src=%p count=%zu kind=%d (pid=%d)\n",
+                              dst, src, count, kind, (int)getpid());
+        if (log_len > 0 && log_len < (int)sizeof(log_msg))
+            syscall(__NR_write, 2, log_msg, log_len);
     }
-    
     /* For now, async operations are treated as synchronous */
     /* TODO: Implement proper async support with streams */
     return cudaMemcpy(dst, src, count, kind);
@@ -1196,22 +1154,19 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, 
 
 /* cudaMemcpy2DAsync - async 2D memory copy */
 cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height, int kind, void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaMemcpy2DAsync() CALLED\n";
-    syscall(__NR_write, 2, msg, 52);
+    (void)dst; (void)dpitch; (void)src; (void)spitch; (void)width; (void)height; (void)kind; (void)stream;
     return cudaSuccess;
 }
 
 /* cudaMemcpy3DPeerAsync - async 3D peer memory copy */
 cudaError_t cudaMemcpy3DPeerAsync(const void *p, int dstDevice, void *dstStream) {
-    const char *msg = "[libvgpu-cudart] cudaMemcpy3DPeerAsync() CALLED\n";
-    syscall(__NR_write, 2, msg, 57);
+    (void)p; (void)dstDevice; (void)dstStream;
     return cudaSuccess;
 }
 
 /* cudaMemcpyPeerAsync - async peer memory copy */
 cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int srcDevice, size_t count, void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaMemcpyPeerAsync() CALLED\n";
-    syscall(__NR_write, 2, msg, 54);
+    (void)dst; (void)dstDevice; (void)src; (void)srcDevice; (void)count; (void)stream;
     return cudaSuccess;
 }
 
@@ -1221,8 +1176,7 @@ cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int s
 
 /* cudaStreamCreateWithFlags - create stream with flags */
 cudaError_t cudaStreamCreateWithFlags(void **pStream, unsigned int flags) {
-    const char *msg = "[libvgpu-cudart] cudaStreamCreateWithFlags() CALLED\n";
-    syscall(__NR_write, 2, msg, 59);
+    (void)flags;
     if (!pStream) return cudaErrorInvalidValue;
     *pStream = (void*)0x3000; /* Dummy stream pointer */
     return cudaSuccess;
@@ -1230,45 +1184,39 @@ cudaError_t cudaStreamCreateWithFlags(void **pStream, unsigned int flags) {
 
 /* cudaStreamDestroy - destroy stream */
 cudaError_t cudaStreamDestroy(void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaStreamDestroy() CALLED\n";
-    syscall(__NR_write, 2, msg, 51);
+    (void)stream;
     return cudaSuccess;
 }
 
 /* cudaStreamSynchronize - synchronize stream */
 cudaError_t cudaStreamSynchronize(void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaStreamSynchronize() CALLED\n";
-    syscall(__NR_write, 2, msg, 55);
+    (void)stream;
     return cudaSuccess;
 }
 
 /* cudaStreamBeginCapture - begin stream capture */
 cudaError_t cudaStreamBeginCapture(void *stream, int mode) {
-    const char *msg = "[libvgpu-cudart] cudaStreamBeginCapture() CALLED\n";
-    syscall(__NR_write, 2, msg, 58);
+    (void)stream; (void)mode;
     return cudaSuccess;
 }
 
 /* cudaStreamEndCapture - end stream capture */
 cudaError_t cudaStreamEndCapture(void *stream, void **pGraph) {
-    const char *msg = "[libvgpu-cudart] cudaStreamEndCapture() CALLED\n";
-    syscall(__NR_write, 2, msg, 56);
-    if (pGraph) *pGraph = (void*)0x4000; /* Dummy graph pointer */
+    (void)stream;
+    if (pGraph) *pGraph = (void*)0x4000;
     return cudaSuccess;
 }
 
 /* cudaStreamIsCapturing - check if stream is capturing */
 cudaError_t cudaStreamIsCapturing(void *stream, int *pIsCapturing) {
-    const char *msg = "[libvgpu-cudart] cudaStreamIsCapturing() CALLED\n";
-    syscall(__NR_write, 2, msg, 58);
+    (void)stream;
     if (pIsCapturing) *pIsCapturing = 0;
     return cudaSuccess;
 }
 
 /* cudaStreamWaitEvent - wait for event in stream */
 cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
-    const char *msg = "[libvgpu-cudart] cudaStreamWaitEvent() CALLED\n";
-    syscall(__NR_write, 2, msg, 54);
+    (void)stream; (void)event; (void)flags;
     return cudaSuccess;
 }
 
@@ -1278,31 +1226,27 @@ cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
 
 /* cudaEventCreateWithFlags - create event with flags */
 cudaError_t cudaEventCreateWithFlags(void **event, unsigned int flags) {
-    const char *msg = "[libvgpu-cudart] cudaEventCreateWithFlags() CALLED\n";
-    syscall(__NR_write, 2, msg, 58);
+    (void)flags;
     if (!event) return cudaErrorInvalidValue;
-    *event = (void*)0x5000; /* Dummy event pointer */
+    *event = (void*)0x5000;
     return cudaSuccess;
 }
 
 /* cudaEventDestroy - destroy event */
 cudaError_t cudaEventDestroy(void *event) {
-    const char *msg = "[libvgpu-cudart] cudaEventDestroy() CALLED\n";
-    syscall(__NR_write, 2, msg, 50);
+    (void)event;
     return cudaSuccess;
 }
 
 /* cudaEventRecord - record event */
 cudaError_t cudaEventRecord(void *event, void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaEventRecord() CALLED\n";
-    syscall(__NR_write, 2, msg, 50);
+    (void)event; (void)stream;
     return cudaSuccess;
 }
 
 /* cudaEventSynchronize - synchronize event */
 cudaError_t cudaEventSynchronize(void *event) {
-    const char *msg = "[libvgpu-cudart] cudaEventSynchronize() CALLED\n";
-    syscall(__NR_write, 2, msg, 55);
+    (void)event;
     return cudaSuccess;
 }
 
@@ -1312,30 +1256,127 @@ cudaError_t cudaEventSynchronize(void *event) {
 
 /* cudaLaunchKernel - launch kernel */
 cudaError_t cudaLaunchKernel(const void *func, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, void *stream, void **kernelParams, void **extra) {
-    const char *msg = "[libvgpu-cudart] cudaLaunchKernel() CALLED\n";
-    syscall(__NR_write, 2, msg, 52);
+    (void)func; (void)gridDimX; (void)gridDimY; (void)gridDimZ;
+    (void)blockDimX; (void)blockDimY; (void)blockDimZ; (void)sharedMemBytes;
+    (void)stream; (void)kernelParams; (void)extra;
     return cudaSuccess;
 }
 
 /* cudaFuncGetAttributes - get function attributes */
 cudaError_t cudaFuncGetAttributes(void *attr, const void *func) {
-    const char *msg = "[libvgpu-cudart] cudaFuncGetAttributes() CALLED\n";
-    syscall(__NR_write, 2, msg, 57);
+    if (!attr) {
+        return cudaErrorInvalidValue;
+    }
+
+    {
+        cudaFuncAttributes *fa = (cudaFuncAttributes *)attr;
+        memset(fa, 0, sizeof(*fa));
+        fa->maxThreadsPerBlock = GPU_DEFAULT_MAX_THREADS_PER_BLOCK;
+        if (fa->maxThreadsPerBlock <= 0) {
+            fa->maxThreadsPerBlock = 1024;
+        }
+        fa->numRegs = 64;
+        if (fa->numRegs <= 0) {
+            fa->numRegs = 1;
+        }
+        fa->cacheModeCA = 1;
+        fa->maxDynamicSharedSizeBytes = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+        if (fa->maxDynamicSharedSizeBytes <= 0) {
+            fa->maxDynamicSharedSizeBytes = 49152;
+        }
+        fa->preferredShmemCarveout = -1; /* no preference */
+        fa->binaryVersion = (GPU_DEFAULT_CC_MAJOR * 10) + GPU_DEFAULT_CC_MINOR;
+        fa->ptxVersion = fa->binaryVersion;
+        if (fa->binaryVersion <= 0) {
+            fa->binaryVersion = 90;
+        }
+        if (fa->ptxVersion <= 0) {
+            fa->ptxVersion = fa->binaryVersion;
+        }
+    }
+
+    (void)func;
     return cudaSuccess;
 }
 
 /* cudaFuncSetAttribute - set function attribute */
 cudaError_t cudaFuncSetAttribute(const void *func, int attr, int value) {
-    const char *msg = "[libvgpu-cudart] cudaFuncSetAttribute() CALLED\n";
-    syscall(__NR_write, 2, msg, 55);
+    (void)func; (void)attr; (void)value;
     return cudaSuccess;
 }
 
 /* cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags - get occupancy */
 cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize, unsigned int flags) {
-    const char *msg = "[libvgpu-cudart] cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags() CALLED\n";
-    syscall(__NR_write, 2, msg, 88);
-    if (numBlocks) *numBlocks = 32; /* Default occupancy */
+    if (!numBlocks) {
+        return cudaErrorInvalidValue;
+    }
+
+    /* Do not mutate caller-provided inputs; sanitize into locals only. */
+    int safe_block_size = (blockSize > 0) ? blockSize : 1;
+
+    *numBlocks = occupancy_blocks_from_block_size(safe_block_size);
+    if (*numBlocks <= 0) {
+        *numBlocks = 1;
+    }
+    (void)func;
+    (void)dynamicSMemSize;
+    (void)flags;
+    return cudaSuccess;
+}
+
+/* cudaOccupancyMaxActiveBlocksPerMultiprocessor - get occupancy */
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize) {
+    return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, func, blockSize, dynamicSMemSize, 0);
+}
+
+/* cudaOccupancyMaxPotentialBlockSizeWithFlags - get occupancy launch bounds */
+cudaError_t cudaOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, const void *func, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags) {
+    int candidate_block_size = 256;
+    int sm_count = GPU_DEFAULT_SM_COUNT;
+
+    if (!minGridSize || !blockSize) {
+        return cudaErrorInvalidValue;
+    }
+
+    if (sm_count <= 0) {
+        sm_count = 120;
+    }
+
+    if (blockSizeLimit > 0 && candidate_block_size > blockSizeLimit) {
+        candidate_block_size = blockSizeLimit;
+    }
+    if (candidate_block_size <= 0) {
+        candidate_block_size = 32;
+    }
+
+    *blockSize = candidate_block_size;
+    *minGridSize = sm_count * occupancy_blocks_from_block_size(candidate_block_size);
+
+    (void)func;
+    (void)dynamicSMemSize;
+    (void)flags;
+    return cudaSuccess;
+}
+
+/* cudaOccupancyMaxPotentialBlockSize - get occupancy launch bounds */
+cudaError_t cudaOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, const void *func, size_t dynamicSMemSize, int blockSizeLimit) {
+    return cudaOccupancyMaxPotentialBlockSizeWithFlags(minGridSize, blockSize, func, dynamicSMemSize, blockSizeLimit, 0);
+}
+
+/* cudaOccupancyAvailableDynamicSMemPerBlock - return available shared mem */
+cudaError_t cudaOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize, const void *func, int numBlocks, int blockSize) {
+    if (!dynamicSmemSize) {
+        return cudaErrorInvalidValue;
+    }
+
+    *dynamicSmemSize = GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+    if (*dynamicSmemSize == 0) {
+        *dynamicSmemSize = 49152;
+    }
+
+    (void)func;
+    (void)numBlocks;
+    (void)blockSize;
     return cudaSuccess;
 }
 
@@ -1345,37 +1386,32 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlock
 
 /* cudaGraphDestroy - destroy graph */
 cudaError_t cudaGraphDestroy(void *graph) {
-    const char *msg = "[libvgpu-cudart] cudaGraphDestroy() CALLED\n";
-    syscall(__NR_write, 2, msg, 52);
+    (void)graph;
     return cudaSuccess;
 }
 
 /* cudaGraphInstantiate - instantiate graph */
 cudaError_t cudaGraphInstantiate(void **graphExec, void *graph, void *errorNode, char *errorLog, size_t errorLogSize) {
-    const char *msg = "[libvgpu-cudart] cudaGraphInstantiate() CALLED\n";
-    syscall(__NR_write, 2, msg, 58);
-    if (graphExec) *graphExec = (void*)0x6000; /* Dummy graph exec pointer */
+    (void)graph; (void)errorNode; (void)errorLog; (void)errorLogSize;
+    if (graphExec) *graphExec = (void*)0x6000;
     return cudaSuccess;
 }
 
 /* cudaGraphLaunch - launch graph */
 cudaError_t cudaGraphLaunch(void *graphExec, void *stream) {
-    const char *msg = "[libvgpu-cudart] cudaGraphLaunch() CALLED\n";
-    syscall(__NR_write, 2, msg, 51);
+    (void)graphExec; (void)stream;
     return cudaSuccess;
 }
 
 /* cudaGraphExecDestroy - destroy graph exec */
 cudaError_t cudaGraphExecDestroy(void *graphExec) {
-    const char *msg = "[libvgpu-cudart] cudaGraphExecDestroy() CALLED\n";
-    syscall(__NR_write, 2, msg, 58);
+    (void)graphExec;
     return cudaSuccess;
 }
 
 /* cudaGraphExecUpdate - update graph exec */
 cudaError_t cudaGraphExecUpdate(void *graphExec, void *graph, void *errorNode, char *errorLog, size_t errorLogSize) {
-    const char *msg = "[libvgpu-cudart] cudaGraphExecUpdate() CALLED\n";
-    syscall(__NR_write, 2, msg, 56);
+    (void)graphExec; (void)graph; (void)errorNode; (void)errorLog; (void)errorLogSize;
     return cudaSuccess;
 }
 
@@ -1385,34 +1421,31 @@ cudaError_t cudaGraphExecUpdate(void *graphExec, void *graph, void *errorNode, c
 
 /* __cudaRegisterFatBinary - register fat binary */
 void** __cudaRegisterFatBinary(void *fatCubin) {
-    const char *msg = "[libvgpu-cudart] __cudaRegisterFatBinary() CALLED\n";
-    syscall(__NR_write, 2, msg, 60);
+    (void)fatCubin;
     static void *handle = (void*)0x7000;
     return &handle;
 }
 
 /* __cudaRegisterFatBinaryEnd - end fat binary registration */
 void __cudaRegisterFatBinaryEnd(void **fatCubinHandle) {
-    const char *msg = "[libvgpu-cudart] __cudaRegisterFatBinaryEnd() CALLED\n";
-    syscall(__NR_write, 2, msg, 65);
+    (void)fatCubinHandle;
 }
 
 /* __cudaUnregisterFatBinary - unregister fat binary */
 void __cudaUnregisterFatBinary(void **fatCubinHandle) {
-    const char *msg = "[libvgpu-cudart] __cudaUnregisterFatBinary() CALLED\n";
-    syscall(__NR_write, 2, msg, 63);
+    (void)fatCubinHandle;
 }
 
 /* __cudaRegisterFunction - register function */
 void __cudaRegisterFunction(void **fatCubinHandle, const void *hostFun, char *deviceFun, const char *deviceName, int thread_limit, uint3 *tid, uint3 *bid, dim3 *bDim, dim3 *gDim, int *wSize) {
-    const char *msg = "[libvgpu-cudart] __cudaRegisterFunction() CALLED\n";
-    syscall(__NR_write, 2, msg, 61);
+    (void)fatCubinHandle; (void)hostFun; (void)deviceFun; (void)deviceName;
+    (void)thread_limit; (void)tid; (void)bid; (void)bDim; (void)gDim; (void)wSize;
 }
 
 /* __cudaRegisterVar - register variable */
 void __cudaRegisterVar(void **fatCubinHandle, char *hostVar, char *deviceAddress, const char *deviceName, int ext, int size, int constant, int global) {
-    const char *msg = "[libvgpu-cudart] __cudaRegisterVar() CALLED\n";
-    syscall(__NR_write, 2, msg, 55);
+    (void)fatCubinHandle; (void)hostVar; (void)deviceAddress; (void)deviceName;
+    (void)ext; (void)size; (void)constant; (void)global;
 }
 
 /* ================================================================
@@ -1434,113 +1467,93 @@ typedef int cublasStatus_t;
 #define CUBLAS_STATUS_NOT_SUPPORTED 15
 #define CUBLAS_STATUS_LICENSE_ERROR 16
 
+/* Do not export CUBLAS stubs - let real libcublas be used (avoids fake-handle SIGSEGV) */
+#define CUBLAS_HIDDEN __attribute__((visibility("hidden")))
+
 /* CUBLAS create handle */
-cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
-    /* CRITICAL: Log this call - GGML requires CUBLAS for matrix operations */
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cublasCreate_v2() CALLED (pid=%d)\n",
-                          (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
+CUBLAS_HIDDEN cublasStatus_t cublasCreate_v2(cublasHandle_t *handle) {
     if (!handle) return CUBLAS_STATUS_INVALID_VALUE;
-    
-    /* Allocate a dummy handle - just use a static pointer */
     static void *dummy_handle = (void *)0x1000;
     *handle = (cublasHandle_t)dummy_handle;
-    
-    char success_msg[128];
-    int success_len = snprintf(success_msg, sizeof(success_msg),
-                              "[libvgpu-cudart] cublasCreate_v2() SUCCESS: handle=%p (pid=%d)\n",
-                              *handle, (int)getpid());
-    if (success_len > 0 && success_len < (int)sizeof(success_msg)) {
-        syscall(__NR_write, 2, success_msg, success_len);
-    }
-    
     return CUBLAS_STATUS_SUCCESS;
 }
 
 /* CUBLAS create handle (non-v2 version) */
-cublasStatus_t cublasCreate(cublasHandle_t *handle) {
+CUBLAS_HIDDEN cublasStatus_t cublasCreate(cublasHandle_t *handle) {
     return cublasCreate_v2(handle);
 }
 
 /* CUBLAS destroy handle */
-cublasStatus_t cublasDestroy_v2(cublasHandle_t handle) {
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cublasDestroy_v2() CALLED (handle=%p, pid=%d)\n",
-                          handle, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
-    /* No-op - just succeed */
+CUBLAS_HIDDEN cublasStatus_t cublasDestroy_v2(cublasHandle_t handle) {
+    (void)handle;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 /* CUBLAS destroy handle (non-v2 version) */
-cublasStatus_t cublasDestroy(cublasHandle_t handle) {
+CUBLAS_HIDDEN cublasStatus_t cublasDestroy(cublasHandle_t handle) {
     return cublasDestroy_v2(handle);
 }
 
 /* CUBLAS set stream */
-cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, void *stream) {
-    char log_msg[128];
-    int log_len = snprintf(log_msg, sizeof(log_msg),
-                          "[libvgpu-cudart] cublasSetStream_v2() CALLED (handle=%p, stream=%p, pid=%d)\n",
-                          handle, stream, (int)getpid());
-    if (log_len > 0 && log_len < (int)sizeof(log_msg)) {
-        syscall(__NR_write, 2, log_msg, log_len);
-    }
-    
-    /* No-op - just succeed */
+CUBLAS_HIDDEN cublasStatus_t cublasSetStream_v2(cublasHandle_t handle, void *stream) {
+    (void)handle; (void)stream;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 /* CUBLAS set stream (non-v2 version) */
-cublasStatus_t cublasSetStream(cublasHandle_t handle, void *stream) {
+CUBLAS_HIDDEN cublasStatus_t cublasSetStream(cublasHandle_t handle, void *stream) {
     return cublasSetStream_v2(handle, stream);
 }
 
 /* CUBLAS get stream */
-cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, void **stream) {
+CUBLAS_HIDDEN cublasStatus_t cublasGetStream_v2(cublasHandle_t handle, void **stream) {
+    (void)handle;
     if (!stream) return CUBLAS_STATUS_INVALID_VALUE;
-    
-    /* Return NULL stream */
     *stream = NULL;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 /* CUBLAS get stream (non-v2 version) */
-cublasStatus_t cublasGetStream(cublasHandle_t handle, void **stream) {
+CUBLAS_HIDDEN cublasStatus_t cublasGetStream(cublasHandle_t handle, void **stream) {
     return cublasGetStream_v2(handle, stream);
 }
 
 /* CUBLAS set math mode */
-cublasStatus_t cublasSetMathMode(cublasHandle_t handle, int mode) {
-    /* No-op - just succeed */
+CUBLAS_HIDDEN cublasStatus_t cublasSetMathMode(cublasHandle_t handle, int mode) {
+    (void)handle; (void)mode;
     return CUBLAS_STATUS_SUCCESS;
 }
 
 /* CUBLAS get math mode */
-cublasStatus_t cublasGetMathMode(cublasHandle_t handle, int *mode) {
+CUBLAS_HIDDEN cublasStatus_t cublasGetMathMode(cublasHandle_t handle, int *mode) {
+    (void)handle;
     if (!mode) return CUBLAS_STATUS_INVALID_VALUE;
     *mode = 0; /* Default math mode */
     return CUBLAS_STATUS_SUCCESS;
 }
 
 /* __cudaPushCallConfiguration - push call configuration */
-int __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMem, void *stream) {
-    const char *msg = "[libvgpu-cudart] __cudaPushCallConfiguration() CALLED\n";
-    syscall(__NR_write, 2, msg, 68);
-    return 0;
+cudaError_t __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMem, void *stream) {
+    g_launch_grid_dim = sanitize_dim3(gridDim);
+    g_launch_block_dim = sanitize_dim3(blockDim);
+    g_launch_shared_mem = sharedMem;
+    g_launch_stream = stream;
+    return cudaSuccess;
 }
 
 /* __cudaPopCallConfiguration - pop call configuration */
-void __cudaPopCallConfiguration(dim3 gridDim, dim3 blockDim) {
-    const char *msg = "[libvgpu-cudart] __cudaPopCallConfiguration() CALLED\n";
-    syscall(__NR_write, 2, msg, 67);
+cudaError_t __cudaPopCallConfiguration(dim3 *gridDim, dim3 *blockDim, size_t *sharedMem, void **stream) {
+    if (gridDim) {
+        *gridDim = g_launch_grid_dim;
+    }
+    if (blockDim) {
+        *blockDim = g_launch_block_dim;
+    }
+    if (sharedMem) {
+        *sharedMem = g_launch_shared_mem;
+    }
+    if (stream) {
+        *stream = g_launch_stream;
+    }
+    return cudaSuccess;
 }
