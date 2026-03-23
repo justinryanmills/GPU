@@ -312,13 +312,14 @@ static uint64_t vm_find_guest_stream(vm_state_t *vm, CUstream host)
 }
 
 /* Event mapping helpers */
-static void vm_add_event(vm_state_t *vm, uint64_t guest, CUevent host)
+static int vm_add_event(vm_state_t *vm, uint64_t guest, CUevent host)
 {
-    if (vm->event_count < MAX_EVENT_ENTRIES) {
-        vm->events[vm->event_count].guest_handle = guest;
-        vm->events[vm->event_count].host_event   = host;
-        vm->event_count++;
-    }
+    if (vm->event_count >= MAX_EVENT_ENTRIES)
+        return 0;
+    vm->events[vm->event_count].guest_handle = guest;
+    vm->events[vm->event_count].host_event   = host;
+    vm->event_count++;
+    return 1;
 }
 
 static CUevent vm_find_event(vm_state_t *vm, uint64_t guest)
@@ -1349,12 +1350,15 @@ int cuda_executor_call(cuda_executor_t *exec,
     case CUDA_CALL_STREAM_DESTROY: {
         uint64_t guest_handle = CUDA_UNPACK_U64(call->args, 0);
         CUstream stream = vm_find_stream(vm, guest_handle);
-        if (stream) {
-            rc = ensure_vm_context(exec, vm);
-            if (rc == CUDA_SUCCESS) {
-                rc = cuStreamDestroy(stream);
+        if (!stream) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
+        }
+        rc = ensure_vm_context(exec, vm);
+        if (rc == CUDA_SUCCESS) {
+            rc = cuStreamDestroy(stream);
+            if (rc == CUDA_SUCCESS)
                 vm_remove_stream(vm, guest_handle);
-            }
         }
         break;
     }
@@ -1386,15 +1390,20 @@ int cuda_executor_call(cuda_executor_t *exec,
         uint64_t event_handle = CUDA_UNPACK_U64(call->args, 2);
         uint32_t flags = call->args[4];
 
-        CUstream stream = vm_find_stream(vm, stream_handle);
+        CUstream stream = (stream_handle == 0) ? NULL : vm_find_stream(vm, stream_handle);
         CUevent event = vm_find_event(vm, event_handle);
 
-        if (event) {
-            rc = ensure_vm_context(exec, vm);
-            if (rc == CUDA_SUCCESS) {
-                rc = cuStreamWaitEvent(stream, event, flags);
-            }
+        if (!event) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
         }
+        if (stream_handle != 0 && !stream) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
+        }
+        rc = ensure_vm_context(exec, vm);
+        if (rc == CUDA_SUCCESS)
+            rc = cuStreamWaitEvent(stream, event, flags);
         break;
     }
 
@@ -1410,9 +1419,13 @@ int cuda_executor_call(cuda_executor_t *exec,
         rc = cuEventCreate(&event, flags);
         if (rc == CUDA_SUCCESS) {
             uint64_t guest_handle = (uint64_t)(uintptr_t)event;
-            vm_add_event(vm, guest_handle, event);
-            result->num_results = 1;
-            result->results[0] = guest_handle;
+            if (!vm_add_event(vm, guest_handle, event)) {
+                (void)cuEventDestroy(event);
+                rc = CUDA_ERROR_OUT_OF_MEMORY;
+            } else {
+                result->num_results = 1;
+                result->results[0] = guest_handle;
+            }
         }
         break;
     }
@@ -1420,12 +1433,15 @@ int cuda_executor_call(cuda_executor_t *exec,
     case CUDA_CALL_EVENT_DESTROY: {
         uint64_t guest_handle = CUDA_UNPACK_U64(call->args, 0);
         CUevent event = vm_find_event(vm, guest_handle);
-        if (event) {
-            rc = ensure_vm_context(exec, vm);
-            if (rc == CUDA_SUCCESS) {
-                rc = cuEventDestroy(event);
+        if (!event) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
+        }
+        rc = ensure_vm_context(exec, vm);
+        if (rc == CUDA_SUCCESS) {
+            rc = cuEventDestroy(event);
+            if (rc == CUDA_SUCCESS)
                 vm_remove_event(vm, guest_handle);
-            }
         }
         break;
     }
@@ -1435,14 +1451,19 @@ int cuda_executor_call(cuda_executor_t *exec,
         uint64_t stream_handle = CUDA_UNPACK_U64(call->args, 2);
 
         CUevent event = vm_find_event(vm, event_handle);
-        CUstream stream = vm_find_stream(vm, stream_handle);
+        CUstream stream = (stream_handle == 0) ? NULL : vm_find_stream(vm, stream_handle);
 
-        if (event) {
-            rc = ensure_vm_context(exec, vm);
-            if (rc == CUDA_SUCCESS) {
-                rc = cuEventRecord(event, stream);
-            }
+        if (!event) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
         }
+        if (stream_handle != 0 && !stream) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
+        }
+        rc = ensure_vm_context(exec, vm);
+        if (rc == CUDA_SUCCESS)
+            rc = cuEventRecord(event, stream);
         break;
     }
 
@@ -1450,12 +1471,13 @@ int cuda_executor_call(cuda_executor_t *exec,
         uint64_t guest_handle = CUDA_UNPACK_U64(call->args, 0);
         CUevent event = vm_find_event(vm, guest_handle);
 
-        if (event) {
-            rc = ensure_vm_context(exec, vm);
-            if (rc == CUDA_SUCCESS) {
-                rc = cuEventSynchronize(event);
-            }
+        if (!event) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
         }
+        rc = ensure_vm_context(exec, vm);
+        if (rc == CUDA_SUCCESS)
+            rc = cuEventSynchronize(event);
         break;
     }
 
@@ -1463,12 +1485,13 @@ int cuda_executor_call(cuda_executor_t *exec,
         uint64_t guest_handle = CUDA_UNPACK_U64(call->args, 0);
         CUevent event = vm_find_event(vm, guest_handle);
 
-        if (event) {
-            rc = ensure_vm_context(exec, vm);
-            if (rc == CUDA_SUCCESS) {
-                rc = cuEventQuery(event);
-            }
+        if (!event) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
         }
+        rc = ensure_vm_context(exec, vm);
+        if (rc == CUDA_SUCCESS)
+            rc = cuEventQuery(event);
         break;
     }
 
@@ -1479,17 +1502,21 @@ int cuda_executor_call(cuda_executor_t *exec,
         CUevent start = vm_find_event(vm, start_handle);
         CUevent end = vm_find_event(vm, end_handle);
 
-        if (start && end) {
-            rc = ensure_vm_context(exec, vm);
+        if (!start || !end) {
+            rc = CUDA_ERROR_INVALID_HANDLE;
+            break;
+        }
+        rc = ensure_vm_context(exec, vm);
+        if (rc != CUDA_SUCCESS)
+            break;
+        {
+            float ms = 0.0f;
+            rc = cuEventElapsedTime(&ms, start, end);
             if (rc == CUDA_SUCCESS) {
-                float ms = 0.0f;
-                rc = cuEventElapsedTime(&ms, start, end);
-                if (rc == CUDA_SUCCESS) {
-                    uint32_t fbits;
-                    memcpy(&fbits, &ms, sizeof(float));
-                    result->num_results = 1;
-                    result->results[0] = (uint64_t)fbits;
-                }
+                uint32_t fbits;
+                memcpy(&fbits, &ms, sizeof(float));
+                result->num_results = 1;
+                result->results[0] = (uint64_t)fbits;
             }
         }
         break;

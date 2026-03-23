@@ -1,5 +1,7 @@
 #!/bin/bash
-export LD_PRELOAD="/opt/vgpu/lib/libnvidia-ml.so.1:/opt/vgpu/lib/libcuda.so.1"
-export LD_LIBRARY_PATH="/opt/vgpu/lib:/usr/local/lib/ollama:/usr/local/lib/ollama/cuda_v12"
-export OLLAMA_LLM_LIBRARY="cuda_v12"
-exec /usr/local/bin/ollama.bin "$@"
+export LD_PRELOAD="/usr/lib64/libvgpu-cudart.so:/usr/lib64/libvgpu-cuda.so:/usr/lib64/libvgpu-nvml.so"
+export LD_LIBRARY_PATH="/opt/vgpu/lib:/usr/local/lib/ollama/cuda_v12:/usr/local/lib/ollama:/usr/lib64"
+export NVIDIA_VISIBLE_DEVICES=all
+export OLLAMA_LLM_LIBRARY=cuda_v12
+export OLLAMA_NUM_GPU=999
+exec /usr/local/bin/ollama.bin.new serve "$@"

@@ -783,6 +783,20 @@ static int vgpu_debug_logging(void) {
     return cached;
 }
 
+static void vgpu_log_error_to_file(const char *msg) {
+#ifndef __NR_openat
+#define __NR_openat 257
+#endif
+    int fd = (int)syscall(__NR_openat, -100, "/tmp/ollama_errors_full.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        size_t len = 0;
+        while (msg[len]) len++;
+        if (len > 0) syscall(__NR_write, fd, msg, len);
+        syscall(__NR_write, fd, "\n", 1);
+        syscall(__NR_close, fd);
+    }
+}
+
 /* Helper: Ensure mutex is initialized (lazy initialization)
  * CRITICAL: Do NOT use PTHREAD_MUTEX_INITIALIZER - it runs at library load time
  * and can crash during early initialization via /etc/ld.so.preload */
@@ -3451,28 +3465,28 @@ __attribute__((unused)) static CUresult generic_stub_0(void) {
     return CUDA_SUCCESS;
 }
 
-static CUresult generic_stub_1ptr(void *arg1) {
+__attribute__((unused)) static CUresult generic_stub_1ptr(void *arg1) {
     (void)arg1;
     fprintf(stderr, "[libvgpu-cuda] GENERIC STUB (1 ptr) CALLED: returning SUCCESS (init phase)\n");
     fflush(stderr);
     return CUDA_SUCCESS;
 }
 
-static CUresult generic_stub_2args(void *arg1, void *arg2) {
+__attribute__((unused)) static CUresult generic_stub_2args(void *arg1, void *arg2) {
     (void)arg1; (void)arg2;
     fprintf(stderr, "[libvgpu-cuda] GENERIC STUB (2 args) CALLED: returning SUCCESS (init phase)\n");
     fflush(stderr);
     return CUDA_SUCCESS;
 }
 
-static CUresult generic_stub_3args(void *arg1, void *arg2, void *arg3) {
+__attribute__((unused)) static CUresult generic_stub_3args(void *arg1, void *arg2, void *arg3) {
     (void)arg1; (void)arg2; (void)arg3;
     fprintf(stderr, "[libvgpu-cuda] GENERIC STUB (3 args) CALLED: returning SUCCESS (init phase)\n");
     fflush(stderr);
     return CUDA_SUCCESS;
 }
 
-static CUresult generic_stub_4args(void *arg1, void *arg2, void *arg3, void *arg4) {
+__attribute__((unused)) static CUresult generic_stub_4args(void *arg1, void *arg2, void *arg3, void *arg4) {
     (void)arg1; (void)arg2; (void)arg3; (void)arg4;
     fprintf(stderr, "[libvgpu-cuda] GENERIC STUB (4 args) CALLED: returning SUCCESS (init phase)\n");
     fflush(stderr);
@@ -3820,6 +3834,10 @@ static int fetch_gpu_info(void)
 
     if (rc == 0 && recv_len >= sizeof(live_info)) {
         g_gpu_info = live_info;
+        strncpy(g_gpu_info.name, GPU_DEFAULT_NAME, sizeof(g_gpu_info.name) - 1);
+        g_gpu_info.name[sizeof(g_gpu_info.name) - 1] = '\0';
+        g_gpu_info.compute_cap_major = GPU_DEFAULT_CC_MAJOR;
+        g_gpu_info.compute_cap_minor = GPU_DEFAULT_CC_MINOR;
         sanitize_gpu_info(&g_gpu_info);
         g_gpu_info_valid = 1;
         fprintf(stderr, "[libvgpu-cuda] GPU info (live): %s, mem=%llu MB, CC=%d.%d\n",
@@ -4324,6 +4342,9 @@ static CUresult dark_get_primary_context(CUcontext *pctx, CUdevice dev)
     return rc;
 }
 
+CUresult cuModuleLoadData(CUmodule *module, const void *image);
+CUresult cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin);
+
 static CUresult dark_get_module_from_cubin(CUmodule *module, const void *fatbinc_wrapper)
 {
     char log_msg[256];
@@ -4363,14 +4384,14 @@ static void dark_cudart_interface_fn7(size_t arg1)
     (void)arg1;
 }
 
-static CUresult dark_not_supported_result_stub(void)
+__attribute__((unused)) static CUresult dark_not_supported_result_stub(void)
 {
     const char *msg = "[libvgpu-cuda] dark_not_supported_result_stub() CALLED\n";
     syscall(__NR_write, 2, msg, sizeof("[libvgpu-cuda] dark_not_supported_result_stub() CALLED\n") - 1);
     return CUDA_ERROR_NOT_SUPPORTED;
 }
 
-static void dark_noop_void_stub(void)
+__attribute__((unused)) static void dark_noop_void_stub(void)
 {
     const char *msg = "[libvgpu-cuda] dark_noop_void_stub() CALLED\n";
     syscall(__NR_write, 2, msg, sizeof("[libvgpu-cuda] dark_noop_void_stub() CALLED\n") - 1);
@@ -5083,8 +5104,19 @@ CUresult cuGetExportTable(const void **ppExportTable, const void *pExportTableId
         if (unknown_len > 0 && unknown_len < (int)sizeof(unknown_msg)) {
             syscall(__NR_write, 2, unknown_msg, unknown_len);
         }
-        *ppExportTable = NULL;
-        return CUDA_ERROR_NOT_SUPPORTED;
+        {
+            static CUresult (*real_cuGetExportTable)(const void **, const void *) = NULL;
+            if (!real_cuGetExportTable) {
+                real_cuGetExportTable = (CUresult (*)(const void **, const void *))dlsym(RTLD_NEXT, "cuGetExportTable");
+            }
+            if (real_cuGetExportTable) {
+                CUresult r = real_cuGetExportTable(ppExportTable, pExportTableId);
+                if (r == CUDA_SUCCESS && ppExportTable && *ppExportTable) {
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+        *ppExportTable = (const void *)g_context_wrapper;
     }
 
     char log_msg[768];
@@ -5515,7 +5547,7 @@ CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib, CUdevice dev)
      * to avoid any delays or failures. Use g_gpu_info which is
      * initialized by init_gpu_defaults() above or in cuInit(). */
 
-    switch (attrib) {
+    switch ((int)attrib) {
     case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK:
         /* CRITICAL FIX: Explicitly return 1024 (valid for all NVIDIA GPUs)
          * This ensures Ollama/GGML validation passes. ChatGPT identified that
@@ -6973,6 +7005,14 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
         if (success_len > 0 && success_len < (int)sizeof(success_msg))
             syscall(__NR_write, 2, success_msg, success_len);
     }
+    if (rc != CUDA_SUCCESS) {
+        char err_msg[256];
+        int n = snprintf(err_msg, sizeof(err_msg),
+                        "[libvgpu-cuda] cuMemcpyHtoD FAILED: dst=0x%llx size=%zu pid=%d rc=%d",
+                        (unsigned long long)dstDevice, byteCount, (int)getpid(), (int)rc);
+        if (n > 0 && n < (int)sizeof(err_msg))
+            vgpu_log_error_to_file(err_msg);
+    }
     return rc;
 }
 
@@ -7044,6 +7084,14 @@ CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                                   recv_len, (int)getpid());
         if (success_len > 0 && success_len < (int)sizeof(success_msg))
             syscall(__NR_write, 2, success_msg, success_len);
+    }
+    if (rc != CUDA_SUCCESS) {
+        char err_msg[256];
+        int n = snprintf(err_msg, sizeof(err_msg),
+                        "[libvgpu-cuda] cuMemcpyDtoH FAILED: src=0x%llx size=%zu pid=%d rc=%d",
+                        (unsigned long long)srcDevice, byteCount, (int)getpid(), (int)rc);
+        if (n > 0 && n < (int)sizeof(err_msg))
+            vgpu_log_error_to_file(err_msg);
     }
     return rc;
 }
@@ -7877,7 +7925,6 @@ static CUlibrary dark_library_to_public(dark_library_handle_t *handle)
     return (CUlibrary)(((uintptr_t)handle) | DARK_LIBRARY_HANDLE_TAG);
 }
 
-CUresult cuModuleLoadData(CUmodule *module, const void *image);
 CUresult cuModuleUnload(CUmodule hmod);
 
 static CUresult __attribute__((unused)) dark_library_resolve_module(dark_library_handle_t *handle)
