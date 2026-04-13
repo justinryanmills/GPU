@@ -1,4 +1,5 @@
 #!/bin/bash
+# Comprehensive test script for shim injection
 
 set -euo pipefail
 

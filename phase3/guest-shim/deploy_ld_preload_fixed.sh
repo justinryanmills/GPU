@@ -1,4 +1,8 @@
 #!/bin/bash
+# deploy_ld_preload_fixed.sh
+# FIXED: Properly handles /etc/ld.so.preload when it doesn't exist
+# This script fixes the "cannot stat '/etc/ld.so.preload': No such file or directory" error
+
 set -euo pipefail
 
 LIB_PATH="/usr/lib64/libvgpu-cuda.so"
@@ -23,12 +27,14 @@ warn() {
     echo -e "${YELLOW}WARNING: $1${NC}"
 }
 
+# Check if library exists
 if [ ! -f "$LIB_PATH" ]; then
     error "Library not found at $LIB_PATH"
 fi
 
 success "Library found at $LIB_PATH"
 
+# Step 1: Check if /etc/ld.so.preload exists
 echo ""
 echo "Step 1: Checking if /etc/ld.so.preload exists..."
 if [ -f "$PRELOAD_FILE" ]; then
@@ -39,6 +45,7 @@ else
     success "File does not exist (normal) - will create new file"
 fi
 
+# Step 2: Backup ONLY if file exists
 if [ "$FILE_EXISTS" -eq 1 ]; then
     echo ""
     echo "Step 2: Backing up existing /etc/ld.so.preload..."
@@ -60,14 +67,17 @@ else
     echo "Step 2: Skipping backup (file doesn't exist)"
 fi
 
+# Step 3: Deploy - this creates the file if it doesn't exist
 echo ""
 echo "Step 3: Deploying to /etc/ld.so.preload..."
+# Use '>' to create/overwrite the file (works even if file doesn't exist)
 if [ -n "$PASSWORD" ]; then
     echo "$PASSWORD" | sudo -S bash -c "echo '$LIB_PATH' > $PRELOAD_FILE" 2>&1 || error "Deployment failed"
 else
     sudo bash -c "echo '$LIB_PATH' > $PRELOAD_FILE" 2>&1 || error "Deployment failed"
 fi
 
+# Step 4: Verify deployment
 echo ""
 echo "Step 4: Verifying deployment..."
 if [ ! -f "$PRELOAD_FILE" ]; then
@@ -80,6 +90,7 @@ fi
 
 success "Deployment verified - library is in /etc/ld.so.preload"
 
+# Step 5: Test system processes immediately
 echo ""
 echo "Step 5: Testing system processes (safety check)..."
 test_commands=("cat /dev/null" "ls /tmp | head -1" "echo test" "pwd")
@@ -92,6 +103,7 @@ done
 
 success "All system processes working"
 
+# Step 6: Test critical processes
 echo ""
 echo "Step 6: Testing critical system processes..."
 if ! ssh -V > /dev/null 2>&1; then
@@ -104,6 +116,7 @@ fi
 
 success "Critical system processes working"
 
+# Final summary
 echo ""
 echo "=========================================="
 success "Deployment completed successfully!"

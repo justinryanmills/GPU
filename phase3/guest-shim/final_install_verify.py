@@ -75,7 +75,7 @@ stdout, stderr = run('ollama info 2>&1 | head -50', "STEP 10: Ollama GPU detecti
 output_lower = stdout.lower()
 if 'gpu' in output_lower or 'cuda' in output_lower or 'nvidia' in output_lower:
     print("\n" + "="*70)
-    print("GPU DETECTION INDICATORS FOUND")
+    print("✓ GPU DETECTION INDICATORS FOUND")
     print("="*70)
 else:
     print("\n" + "="*70)

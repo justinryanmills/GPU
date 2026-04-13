@@ -1,4 +1,5 @@
 #!/bin/bash
+# Final deployment script for cuInit fix
 
 set -e
 
@@ -22,15 +23,15 @@ if [ ! -f /usr/lib64/libvgpu-cuda.so ]; then
     exit 1
 fi
 
-echo "Build complete: $(ls -lh /usr/lib64/libvgpu-cuda.so | awk '{print $5}')"
+echo "✓ Build complete: $(ls -lh /usr/lib64/libvgpu-cuda.so | awk '{print $5}')"
 echo ""
 
 echo "[2/4] Ensuring /etc/ld.so.preload is configured..."
 if ! grep -q "libvgpu-cuda.so" /etc/ld.so.preload 2>/dev/null; then
     echo "/usr/lib64/libvgpu-cuda.so" | sudo tee -a /etc/ld.so.preload > /dev/null
-    echo "Added to /etc/ld.so.preload"
+    echo "✓ Added to /etc/ld.so.preload"
 else
-    echo "Already in /etc/ld.so.preload"
+    echo "✓ Already in /etc/ld.so.preload"
 fi
 echo ""
 
@@ -41,7 +42,7 @@ sudo systemctl start ollama
 sleep 8
 
 if systemctl is-active --quiet ollama; then
-    echo "Ollama is running"
+    echo "✓ Ollama is running"
 else
     echo "WARNING: Ollama may not be running"
     sudo systemctl status ollama --no-pager -l | head -10
@@ -53,7 +54,7 @@ OLLAMA_PID=$(pgrep -f "ollama serve" | head -1)
 if [ -n "$OLLAMA_PID" ]; then
     echo "Ollama PID: $OLLAMA_PID"
     if [ -f "/tmp/vgpu-shim-cuda-${OLLAMA_PID}.log" ]; then
-        echo "Shim log file found:"
+        echo "✓ Shim log file found:"
         cat "/tmp/vgpu-shim-cuda-${OLLAMA_PID}.log"
     else
         echo "? No shim log file found yet"

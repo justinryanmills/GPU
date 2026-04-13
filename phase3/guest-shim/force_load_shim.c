@@ -90,7 +90,7 @@ int main(int argc, char *argv[])
      * This follows the recommended search order for maximum stability */
     void *cuInit_sym = dlsym(RTLD_DEFAULT, "cuInit");
     if (cuInit_sym) {
-        fprintf(stderr, "[force-load] Verified: CUDA symbols available (cuInit found)\n");
+        fprintf(stderr, "[force-load] ✓ Verified: CUDA symbols available (cuInit found)\n");
         
         /* NOTE: Based on NVIDIA research, we do NOT pre-initialize CUDA here.
          * 
@@ -102,7 +102,7 @@ int main(int argc, char *argv[])
          * The library is now loaded and will initialize automatically when needed.
          * This provides maximum stability and follows NVIDIA's recommended patterns.
          */
-        fprintf(stderr, "[force-load] Libraries loaded (lazy initialization will occur on first CUDA call)\n");
+        fprintf(stderr, "[force-load] ✓ Libraries loaded (lazy initialization will occur on first CUDA call)\n");
     } else {
         fprintf(stderr, "[force-load] ⚠ WARNING: CUDA symbols not yet available (will be loaded via symlinks/LD_PRELOAD)\n");
     }

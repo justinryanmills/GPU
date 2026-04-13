@@ -1,10 +1,18 @@
-/* vGPU config library (Step 2-4). */
+/*
+ * vGPU Configuration Library Implementation
+ * Configuration & Management Interface (Step 2-4)
+ */
+
 #include "vgpu_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+
+/* ============================================================================
+ * Database Management
+ * ============================================================================ */
 
 int vgpu_db_init(sqlite3 **db) {
     int rc;
@@ -130,6 +138,10 @@ int vgpu_db_init_schema(sqlite3 *db) {
     return VGPU_OK;
 }
 
+/* ============================================================================
+ * Pool Management
+ * ============================================================================ */
+
 int vgpu_get_pool_info(sqlite3 *db, char pool_id, vgpu_pool_info_t *pool_info) {
     sqlite3_stmt *stmt;
     const char *sql;
@@ -250,6 +262,10 @@ int vgpu_list_pools(sqlite3 *db, vgpu_pool_info_t *pools, int *count) {
     *count = i;
     return VGPU_OK;
 }
+
+/* ============================================================================
+ * VM Management
+ * ============================================================================ */
 
 int vgpu_get_vm_config(sqlite3 *db, const char *vm_uuid, vgpu_vm_config_t *config) {
     sqlite3_stmt *stmt;
@@ -763,6 +779,10 @@ int vgpu_list_vms(sqlite3 *db, char pool_id, int priority,
     *count = i;
     return VGPU_OK;
 }
+
+/* ============================================================================
+ * Phase 3: Scheduler Weight & Isolation Controls
+ * ============================================================================ */
 
 int vgpu_set_vm_weight(sqlite3 *db, const char *vm_uuid, int weight) {
     sqlite3_stmt *stmt;

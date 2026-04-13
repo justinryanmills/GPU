@@ -1,4 +1,5 @@
 #!/bin/bash
+# Comprehensive VM review script
 
 REVIEW_FILE="/tmp/vm_review_$(date +%s).log"
 exec > >(tee "$REVIEW_FILE") 2>&1
@@ -10,6 +11,7 @@ echo "Hostname: $(hostname)"
 echo "=========================================="
 echo ""
 
+# 1. System Information
 echo "=== 1. SYSTEM INFORMATION ==="
 echo "OS: $(uname -a)"
 echo ""
@@ -20,6 +22,7 @@ echo "Memory:"
 free -h | head -2
 echo ""
 
+# 2. Ollama Service Status
 echo "=== 2. OLLAMA SERVICE STATUS ==="
 systemctl is-active ollama && echo "Status: ACTIVE" || echo "Status: INACTIVE"
 echo ""
@@ -27,6 +30,7 @@ echo "Service Details:"
 systemctl status ollama --no-pager -l | head -15
 echo ""
 
+# 3. Ollama Process
 echo "=== 3. OLLAMA PROCESS ==="
 OLLAMA_PID=$(pgrep -f "ollama serve" | head -1)
 if [ -n "$OLLAMA_PID" ]; then
@@ -42,6 +46,7 @@ else
 fi
 echo ""
 
+# 4. Shim Libraries
 echo "=== 4. SHIM LIBRARY STATUS ==="
 echo "CUDA Shim:"
 ls -lh /usr/lib64/libvgpu-cuda.so 2>&1
@@ -52,6 +57,7 @@ ls -lh /usr/lib64/libvgpu-nvml.so 2>&1
 file /usr/lib64/libvgpu-nvml.so 2>&1
 echo ""
 
+# 5. ld.so.preload
 echo "=== 5. LD.SO.PRELOAD ==="
 if [ -f /etc/ld.so.preload ]; then
     echo "Contents:"
@@ -61,6 +67,7 @@ else
 fi
 echo ""
 
+# 6. Loaded Libraries in Process
 echo "=== 6. LOADED LIBRARIES IN OLLAMA ==="
 if [ -n "$OLLAMA_PID" ]; then
     echo "CUDA/vGPU related libraries:"
@@ -70,6 +77,7 @@ else
 fi
 echo ""
 
+# 7. Shim Logs
 echo "=== 7. SHIM LOG FILES ==="
 if [ -n "$OLLAMA_PID" ]; then
     SHIM_LOG="/tmp/vgpu-shim-cuda-${OLLAMA_PID}.log"
@@ -78,7 +86,7 @@ if [ -n "$OLLAMA_PID" ]; then
         cat "$SHIM_LOG"
         echo ""
         if grep -q "Pre-initialization succeeded" "$SHIM_LOG"; then
-            echo "Pre-initialization SUCCESS found in log"
+            echo "✓ Pre-initialization SUCCESS found in log"
         else
             echo "✗ Pre-initialization success NOT found"
         fi
@@ -90,6 +98,7 @@ else
 fi
 echo ""
 
+# 8. Source Files
 echo "=== 8. SOURCE FILES ==="
 if [ -d ~/phase3/guest-shim ]; then
     echo "Source directory exists:"
@@ -110,35 +119,41 @@ else
 fi
 echo ""
 
+# 9. Ollama Logs - Library Mode
 echo "=== 9. OLLAMA LOGS - LIBRARY MODE ==="
 sudo journalctl -u ollama -n 500 --no-pager 2>&1 | grep -E "library=" | tail -10 || echo "No library mode entries found"
 echo ""
 
+# 10. Recent Errors
 echo "=== 10. RECENT ERRORS ==="
 sudo journalctl -u ollama -n 200 --no-pager 2>&1 | grep -iE "error|fail|panic|crash" | tail -10 || echo "No errors found"
 echo ""
 
+# 11. Deployment Scripts
 echo "=== 11. DEPLOYMENT SCRIPTS ==="
 if [ -f ~/safe_deploy.sh ]; then
-    echo "~/safe_deploy.sh exists"
+    echo "✓ ~/safe_deploy.sh exists"
     ls -lh ~/safe_deploy.sh
 elif [ -f ~/phase3/guest-shim/safe_deploy.sh ]; then
-    echo "~/phase3/guest-shim/safe_deploy.sh exists"
+    echo "✓ ~/phase3/guest-shim/safe_deploy.sh exists"
     ls -lh ~/phase3/guest-shim/safe_deploy.sh
 else
     echo "✗ safe_deploy.sh not found"
 fi
 echo ""
 
+# 12. Available Models
 echo "=== 12. AVAILABLE MODELS ==="
 timeout 10 ollama list 2>&1 | head -10 || echo "Could not list models"
 echo ""
 
+# 13. Summary
 echo "=========================================="
 echo "SUMMARY"
 echo "=========================================="
 echo ""
 
+# Check key indicators
 ISSUES=0
 WARNINGS=0
 
@@ -190,7 +205,7 @@ if echo "$LIBRARY_MODE" | grep -qi "library=cpu"; then
     echo "⚠ WARNING: Ollama is using CPU mode (library=cpu)"
     WARNINGS=$((WARNINGS + 1))
 elif echo "$LIBRARY_MODE" | grep -qi "library=cuda"; then
-    echo "SUCCESS: Ollama is using GPU mode (library=cuda)"
+    echo "✓ SUCCESS: Ollama is using GPU mode (library=cuda)"
 else
     echo "⚠ WARNING: Could not determine library mode from logs"
     WARNINGS=$((WARNINGS + 1))

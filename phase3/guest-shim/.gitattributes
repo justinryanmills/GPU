@@ -1,0 +1,2 @@
+# systemd drop-ins must use LF only; CRLF breaks parsing on Linux guests.
+*.conf text eol=lf

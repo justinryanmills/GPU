@@ -1,7 +1,20 @@
-/* Phase 3: Per-VM token bucket rate limiter (0 = unlimited). */
+/*
+ * Phase 3: Per-VM Token Bucket Rate Limiter
+ *
+ * Each VM has a bucket that refills at max_jobs_per_sec tokens/second.
+ * Tokens accumulate up to max_jobs_per_sec (1-second burst capacity).
+ * If the bucket is empty, the request is rejected with RL_REJECT_RATE.
+ * If the VM's current queue depth exceeds max_queue_depth, rejected
+ * with RL_REJECT_QUEUE.
+ *
+ * Rate = 0 means unlimited (always allowed).
+ */
+
 #include "rate_limiter.h"
 #include <string.h>
 #include <stdio.h>
+
+/* ---- Internal ---------------------------------------------------------- */
 
 static rl_bucket_t *find_bucket(rate_limiter_t *rl, uint32_t vm_id)
 {
@@ -27,6 +40,8 @@ static void refill_tokens(rl_bucket_t *b)
         b->last_refill = now;
     }
 }
+
+/* ---- Public API -------------------------------------------------------- */
 
 void rl_init(rate_limiter_t *rl)
 {

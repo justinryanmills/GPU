@@ -1,4 +1,13 @@
 #!/bin/bash
+#
+# Symbol verification script for libvgpu-cudart.so
+#
+# This script verifies which of the 39 "undefined" symbols actually exist
+# in the library and checks if version symbols are exported correctly.
+#
+# Usage: ./verify_symbols.sh
+#
+
 set -e
 
 LIB_PATH="/usr/lib64/libvgpu-cudart.so"
@@ -9,6 +18,7 @@ echo "Symbol Verification Script"
 echo "=========================================="
 echo ""
 
+# Check if library exists
 if [ ! -f "$LIB_PATH" ]; then
     echo "ERROR: Library not found: $LIB_PATH"
     echo "Please build and install the library first."
@@ -19,6 +29,7 @@ echo "[1/5] Checking library file..."
 ls -lh "$LIB_PATH"
 echo ""
 
+# List of undefined symbols from ldd -r output
 UNDEFINED_SYMBOLS=(
     "cudaEventCreateWithFlags"
     "cudaEventDestroy"
@@ -69,9 +80,10 @@ FOUND_SYMBOLS=()
 NOT_FOUND_SYMBOLS=()
 
 for symbol in "${UNDEFINED_SYMBOLS[@]}"; do
+    # Check if symbol exists (with or without version)
     if nm -D "$LIB_PATH" 2>/dev/null | grep -q " $symbol"; then
         FOUND_SYMBOLS+=("$symbol")
-        echo "  Found: $symbol"
+        echo "  ✓ Found: $symbol"
     else
         NOT_FOUND_SYMBOLS+=("$symbol")
         echo "  ✗ Missing: $symbol"
@@ -83,14 +95,16 @@ echo "[3/5] Checking version symbols..."
 echo "Using readelf -V to check version information..."
 echo ""
 
+# Check if version script was applied
 if readelf -V "$LIB_PATH" 2>/dev/null | grep -q "libcudart.so.12"; then
-    echo "  Version script applied (libcudart.so.12 found)"
+    echo "  ✓ Version script applied (libcudart.so.12 found)"
     VERSION_APPLIED=1
 else
     echo "  ✗ Version script NOT applied"
     VERSION_APPLIED=0
 fi
 
+# Check versioned symbols
 VERSIONED_COUNT=0
 for symbol in "${FOUND_SYMBOLS[@]}"; do
     if readelf -V "$LIB_PATH" 2>/dev/null | grep -q "$symbol.*libcudart.so.12"; then
@@ -104,6 +118,7 @@ echo ""
 echo "[4/5] Checking symbol resolution with ldd -r..."
 echo ""
 
+# Run ldd -r on libggml-cuda.so to see what it reports
 if [ -f "$GGML_LIB" ]; then
     echo "Checking undefined symbols in $GGML_LIB:"
     ldd -r "$GGML_LIB" 2>&1 | grep -E "undefined.*cuda" | head -20 || echo "  (no undefined CUDA symbols found)"
@@ -136,7 +151,7 @@ FOUND SYMBOLS
 EOF
 
 for symbol in "${FOUND_SYMBOLS[@]}"; do
-    echo "  $symbol" >> "$REPORT_FILE"
+    echo "  ✓ $symbol" >> "$REPORT_FILE"
 done
 
 cat >> "$REPORT_FILE" <<EOF

@@ -51,6 +51,102 @@ static int cudart_debug_logging(void) {
     return cached;
 }
 
+/* Extra per-call runtime tracing, default off to avoid perturbing working runs. */
+static int cudart_diag_logging(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (getenv("VGPU_CUDART_DIAG") != NULL || getenv("VGPU_DEBUG") != NULL) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Quick error capture: append line to /tmp/ollama_errors_full.log (syscalls only). */
+static void cudart_log_error_to_file(const char *msg) {
+#ifndef __NR_openat
+#define __NR_openat 257
+#endif
+    int fd = (int)syscall(__NR_openat, -100, "/tmp/ollama_errors_full.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        size_t len = 0;
+        while (msg[len]) len++;
+        if (len > 0) syscall(__NR_write, fd, msg, len);
+        syscall(__NR_write, fd, "\n", 1);
+        syscall(__NR_close, fd);
+    }
+}
+
+/* Narrow trace for memcpy/sync sequencing around GGML set_tensor(). */
+static void cudart_trace_to_file(const char *msg) {
+#ifndef __NR_openat
+#define __NR_openat 257
+#endif
+    int fd = (int)syscall(__NR_openat, -100, "/tmp/vgpu_cudart_trace.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        size_t len = 0;
+        while (msg[len]) len++;
+        if (len > 0) syscall(__NR_write, fd, msg, len);
+        syscall(__NR_write, fd, "\n", 1);
+        syscall(__NR_close, fd);
+    }
+}
+
+static void cudart_trace_memcpy_async(const char *phase, void *dst, const void *src,
+                                      size_t count, int kind, void *stream, int rc) {
+    if (!cudart_diag_logging()) return;
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg),
+                     "[libvgpu-cudart] %s kind=%d count=%zu stream=%p dst=%p src=%p rc=%d pid=%d",
+                     phase, kind, count, stream, dst, src, rc, (int)getpid());
+    if (n > 0 && n < (int)sizeof(msg)) {
+        cudart_trace_to_file(msg);
+    }
+}
+
+static void cudart_trace_large_htod(const char *api, const char *phase, void *dst,
+                                    const void *src, size_t count, int kind,
+                                    void *stream, int rc) {
+    enum { CUDART_HTOD_TRACE_MIN = 4096 };
+    if (!api || !phase) return;
+    if (!(kind == 1 || kind == 4) || count < CUDART_HTOD_TRACE_MIN) return;
+
+    const uint8_t *bytes = (const uint8_t *)src;
+    unsigned int b0 = (src && count > 0) ? bytes[0] : 0;
+    unsigned int b1 = (src && count > 1) ? bytes[1] : 0;
+    unsigned int b2 = (src && count > 2) ? bytes[2] : 0;
+    unsigned int b3 = (src && count > 3) ? bytes[3] : 0;
+    unsigned int b4 = (src && count > 4) ? bytes[4] : 0;
+    unsigned int b5 = (src && count > 5) ? bytes[5] : 0;
+    unsigned int b6 = (src && count > 6) ? bytes[6] : 0;
+    unsigned int b7 = (src && count > 7) ? bytes[7] : 0;
+
+    char msg[320];
+    int n = snprintf(msg, sizeof(msg),
+                     "[libvgpu-cudart] %s %s kind=%d count=%zu stream=%p dst=%p src=%p rc=%d first8=%02x%02x%02x%02x%02x%02x%02x%02x pid=%d",
+                     api, phase, kind, count, stream, dst, src, rc,
+                     b0, b1, b2, b3, b4, b5, b6, b7, (int)getpid());
+    if (n > 0 && n < (int)sizeof(msg)) {
+        int fd = (int)syscall(__NR_openat, -100, "/var/tmp/vgpu_cudart_htod_trace.log",
+                              O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            (void)syscall(__NR_write, fd, msg, (size_t)n);
+            (void)syscall(__NR_write, fd, "\n", 1);
+            (void)syscall(__NR_close, fd);
+        }
+    }
+}
+
+static void cudart_trace_stream_sync(const char *phase, void *stream, int rc) {
+    if (!cudart_diag_logging()) return;
+    char msg[192];
+    int n = snprintf(msg, sizeof(msg),
+                     "[libvgpu-cudart] %s stream=%p rc=%d pid=%d",
+                     phase, stream, rc, (int)getpid());
+    if (n > 0 && n < (int)sizeof(msg)) {
+        cudart_trace_to_file(msg);
+    }
+}
+
 /* Transport types - forward declarations */
 typedef struct cuda_transport cuda_transport_t;
 /* CUDACallResult is defined in cuda_protocol.h */
@@ -308,9 +404,9 @@ static void sanitize_device_prop_nonzero(cudaDeviceProp *prop) {
     if (prop->regsPerBlock <= 0) prop->regsPerBlock = 65536;
     if (prop->sharedMemPerBlock == 0) prop->sharedMemPerBlock = 49152;
     if (prop->sharedMemPerMultiprocessor == 0) prop->sharedMemPerMultiprocessor = 233472;
-    if (prop->sharedMemPerBlockOptin <= 0) prop->sharedMemPerBlockOptin = 49152;
+    if (prop->sharedMemPerBlockOptin <= 0) prop->sharedMemPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK_OPTIN;
     if (prop->maxSharedMemoryPerMultiProcessor <= 0) prop->maxSharedMemoryPerMultiProcessor = 233472;
-    if (prop->maxSharedMemoryPerBlockOptin <= 0) prop->maxSharedMemoryPerBlockOptin = 49152;
+    if (prop->maxSharedMemoryPerBlockOptin <= 0) prop->maxSharedMemoryPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK_OPTIN;
     if (prop->maxSharedMemoryPerBlock <= 0) prop->maxSharedMemoryPerBlock = 49152;
     if (prop->clockRate <= 0) prop->clockRate = 1400000;
     if (prop->memoryClockRate <= 0) prop->memoryClockRate = 2600000;
@@ -576,7 +672,7 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device) {
         *value = (int)GPU_DEFAULT_SHARED_MEM_PER_SM;
         break;
     case 97:  /* cudaDevAttrMaxSharedMemoryPerBlockOptin */
-        *value = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+        *value = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK_OPTIN;
         break;
     default:
         *value = 1;
@@ -601,12 +697,13 @@ static void patch_ggml_cuda_device_prop(void *prop_ptr) {
     // Cast to byte pointer for offset access
     uint8_t *ptr = (uint8_t *)prop_ptr;
 
-    // Patch at multiple offsets - GGML may use different cudaDeviceProp layouts.
-    // CUDA 12: 0x148/0x14C (computeCapabilityMajor/Minor)
-    // Legacy: 0x15C/0x160 (major/minor)
-    // Observed in the deployed libggml-cuda.so build: 0x168/0x16C
-    size_t offsets_major[] = {0x148, 0x15C, 0x168};
-    size_t offsets_minor[] = {0x14C, 0x160, 0x16C};
+    // Patch CC at offsets that are actually compute-capacity fields in cudaDeviceProp.
+    // CUDA 12: 0x148/0x14C (computeCapabilityMajor/Minor); legacy: 0x15C/0x160 (major/minor).
+    // Do NOT patch 0x168/0x16C — in CUDA 12 headers those are texturePitchAlignment and
+    // deviceOverlap; writing 9/0 there was corrupting alignment (e.g. pitch=9) and can
+    // SIGSEGV in GGML/llama NewContextWithModel paths.
+    size_t offsets_major[] = {0x148, 0x15C};
+    size_t offsets_minor[] = {0x14C, 0x160};
 
     int major = GPU_DEFAULT_CC_MAJOR;
     int minor = GPU_DEFAULT_CC_MINOR;
@@ -620,13 +717,12 @@ static void patch_ggml_cuda_device_prop(void *prop_ptr) {
     if (cudart_debug_logging()) {
         int verify_major = *((int32_t *)(ptr + 0x148));
         int verify_minor = *((int32_t *)(ptr + 0x14C));
-        int verify_major_alt = *((int32_t *)(ptr + 0x168));
-        int verify_minor_alt = *((int32_t *)(ptr + 0x16C));
+        int tex_pitch = *((int32_t *)(ptr + 0x168));
         char patch_buf[512];
         int patch_len = snprintf(patch_buf, sizeof(patch_buf),
-                                "[GGML PATCH] Patched cudaDeviceProp at prop=%p: major=%d minor=%d (verified: 0x148=%d 0x14C=%d 0x168=%d 0x16C=%d, pid=%d)\n",
+                                "[GGML PATCH] Patched cudaDeviceProp at prop=%p: major=%d minor=%d (verified: 0x148=%d 0x14C=%d texturePitchAlignment@0x168=%d, pid=%d)\n",
                                 prop_ptr, major, minor, verify_major, verify_minor,
-                                verify_major_alt, verify_minor_alt, (int)getpid());
+                                tex_pitch, (int)getpid());
         if (patch_len > 0 && patch_len < (int)sizeof(patch_buf))
             syscall(__NR_write, 2, patch_buf, patch_len);
     }
@@ -694,9 +790,9 @@ cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *prop, int device) {
     prop->regsPerBlock = 65536;
     prop->sharedMemPerBlock = GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
     prop->sharedMemPerMultiprocessor = GPU_DEFAULT_SHARED_MEM_PER_SM;
-    prop->sharedMemPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+    prop->sharedMemPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK_OPTIN;
     prop->maxSharedMemoryPerMultiProcessor = (int)GPU_DEFAULT_SHARED_MEM_PER_SM;
-    prop->maxSharedMemoryPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
+    prop->maxSharedMemoryPerBlockOptin = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK_OPTIN;
     prop->maxSharedMemoryPerBlock = (int)GPU_DEFAULT_SHARED_MEM_PER_BLOCK;
     prop->maxBlocksPerMultiProcessor = 32;
     prop->singleToDoublePrecisionPerfRatio = 2;
@@ -733,11 +829,14 @@ cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *prop, int device) {
     int *old_minor_ptr = (int*)((char*)prop + 0x160);
     *old_major_ptr = GPU_DEFAULT_CC_MAJOR;
     *old_minor_ptr = GPU_DEFAULT_CC_MINOR;
-    int *ggml_major_ptr = (int*)((char*)prop + 0x168);
-    int *ggml_minor_ptr = (int*)((char*)prop + 0x16C);
-    *ggml_major_ptr = GPU_DEFAULT_CC_MAJOR;
-    *ggml_minor_ptr = GPU_DEFAULT_CC_MINOR;
-    
+
+    /* The deployed GGML build is reading 0x168/0x16C as the legacy major/minor pair.
+     * Keep the primary CUDA 12 slots patched above, and also mirror CC=9.0 here so
+     * GGML does not see the bogus 512.1 capability that steers it into bad paths. */
+    prop->textureAlignment = 512;
+    *((int32_t *)((char*)prop + 0x168)) = GPU_DEFAULT_CC_MAJOR;
+    *((int32_t *)((char*)prop + 0x16C)) = GPU_DEFAULT_CC_MINOR;
+
     int *warpSize_ptr = (int*)((char*)prop + 0x114);
     *warpSize_ptr = GPU_DEFAULT_WARP_SIZE;
 
@@ -1084,6 +1183,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     }
     if (!dst || !src) return cudaErrorInvalidValue;
     if (count == 0) return cudaSuccess;  /* Zero-byte copy is valid no-op per CUDA spec */
+    cudart_trace_large_htod("cudaMemcpy", "enter", dst, src, count, kind, NULL, 0);
     
     /* CRITICAL FIX: Use Driver API which calls transport */
     typedef int (*cuMemcpyHtoD_func)(void *, const void *, size_t);
@@ -1125,6 +1225,14 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
     } else {
         return cudaErrorInvalidValue;
     }
+    if (cuda_result != 0) {
+        char err_msg[256];
+        int n = snprintf(err_msg, sizeof(err_msg),
+                        "[libvgpu-cudart] cudaMemcpy FAILED: kind=%d dst=%p src=%p count=%zu pid=%d cuda_result=%d",
+                        kind, dst, src, count, (int)getpid(), cuda_result);
+        if (n > 0 && n < (int)sizeof(err_msg))
+            cudart_log_error_to_file(err_msg);
+    }
     if (cudart_debug_logging()) {
         char success_msg[128];
         int success_len = snprintf(success_msg, sizeof(success_msg),
@@ -1133,23 +1241,82 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind) {
         if (success_len > 0 && success_len < (int)sizeof(success_msg))
             syscall(__NR_write, 2, success_msg, success_len);
     }
+    cudart_trace_large_htod("cudaMemcpy", "return", dst, src, count, kind, NULL, cuda_result);
     return (cuda_result == 0) ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaMemcpyAsync - async memory copy */
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, int kind, void *stream) {
-    (void)stream;
     if (cudart_debug_logging()) {
         char log_msg[256];
         int log_len = snprintf(log_msg, sizeof(log_msg),
-                              "[libvgpu-cudart] cudaMemcpyAsync() CALLED: dst=%p src=%p count=%zu kind=%d (pid=%d)\n",
-                              dst, src, count, kind, (int)getpid());
+                              "[libvgpu-cudart] cudaMemcpyAsync() CALLED: dst=%p src=%p count=%zu kind=%d stream=%p (pid=%d)\n",
+                              dst, src, count, kind, stream, (int)getpid());
         if (log_len > 0 && log_len < (int)sizeof(log_msg))
             syscall(__NR_write, 2, log_msg, log_len);
     }
-    /* For now, async operations are treated as synchronous */
-    /* TODO: Implement proper async support with streams */
-    return cudaMemcpy(dst, src, count, kind);
+    if (!dst || !src) return cudaErrorInvalidValue;
+    if (count == 0) return cudaSuccess;
+    cudart_trace_large_htod("cudaMemcpyAsync", "enter", dst, src, count, kind, stream, 0);
+
+    typedef int (*cuMemcpyHtoDAsync_func)(void *, const void *, size_t, void *);
+    typedef int (*cuMemcpyDtoHAsync_func)(void *, void *, size_t, void *);
+    typedef int (*cuMemcpyDtoDAsync_func)(void *, void *, size_t, void *);
+
+    int cuda_result = 0;
+    cudart_trace_memcpy_async("cudaMemcpyAsync_enter", dst, src, count, kind, stream, 0);
+
+    if (kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDefault) {
+        cuMemcpyHtoDAsync_func fn = (cuMemcpyHtoDAsync_func)dlsym(RTLD_DEFAULT, "cuMemcpyHtoDAsync_v2");
+        if (!fn) {
+            fn = (cuMemcpyHtoDAsync_func)dlsym(RTLD_DEFAULT, "cuMemcpyHtoDAsync");
+        }
+        if (!fn) {
+            cudart_trace_memcpy_async("cudaMemcpyAsync_fallback_sync_no_symbol",
+                                      dst, src, count, kind, stream, 0);
+            return cudaMemcpy(dst, src, count, kind);
+        }
+        cuda_result = fn(dst, src, count, stream);
+    } else if (kind == cudaMemcpyDeviceToHost) {
+        cuMemcpyDtoHAsync_func fn = (cuMemcpyDtoHAsync_func)dlsym(RTLD_DEFAULT, "cuMemcpyDtoHAsync_v2");
+        if (!fn) {
+            fn = (cuMemcpyDtoHAsync_func)dlsym(RTLD_DEFAULT, "cuMemcpyDtoHAsync");
+        }
+        if (!fn) {
+            cudart_trace_memcpy_async("cudaMemcpyAsync_fallback_sync_no_symbol",
+                                      dst, src, count, kind, stream, 0);
+            return cudaMemcpy(dst, src, count, kind);
+        }
+        cuda_result = fn(dst, (void *)src, count, stream);
+    } else if (kind == cudaMemcpyDeviceToDevice) {
+        cuMemcpyDtoDAsync_func fn = (cuMemcpyDtoDAsync_func)dlsym(RTLD_DEFAULT, "cuMemcpyDtoDAsync_v2");
+        if (!fn) {
+            fn = (cuMemcpyDtoDAsync_func)dlsym(RTLD_DEFAULT, "cuMemcpyDtoDAsync");
+        }
+        if (!fn) {
+            cudart_trace_memcpy_async("cudaMemcpyAsync_fallback_sync_no_symbol",
+                                      dst, src, count, kind, stream, 0);
+            return cudaMemcpy(dst, src, count, kind);
+        }
+        cuda_result = fn(dst, (void *)src, count, stream);
+    } else {
+        cudart_trace_memcpy_async("cudaMemcpyAsync_invalid_kind", dst, src, count, kind, stream, -1);
+        return cudaErrorInvalidValue;
+    }
+
+    cudart_trace_memcpy_async("cudaMemcpyAsync_return", dst, src, count, kind, stream, cuda_result);
+
+    if (cuda_result != 0) {
+        char err_msg[256];
+        int n = snprintf(err_msg, sizeof(err_msg),
+                        "[libvgpu-cudart] cudaMemcpyAsync FAILED: kind=%d dst=%p src=%p count=%zu stream=%p pid=%d cuda_result=%d",
+                        kind, dst, src, count, stream, (int)getpid(), cuda_result);
+        if (n > 0 && n < (int)sizeof(err_msg))
+            cudart_log_error_to_file(err_msg);
+    }
+
+    cudart_trace_large_htod("cudaMemcpyAsync", "return", dst, src, count, kind, stream, cuda_result);
+    return (cuda_result == 0) ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaMemcpy2DAsync - async 2D memory copy */
@@ -1174,23 +1341,56 @@ cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int s
  * CUDA Runtime API — Stream Management
  * ================================================================ */
 
+/* cudaStreamCreate - create stream */
+cudaError_t cudaStreamCreate(void **pStream) {
+    return cudaStreamCreateWithFlags(pStream, 0);
+}
+
 /* cudaStreamCreateWithFlags - create stream with flags */
 cudaError_t cudaStreamCreateWithFlags(void **pStream, unsigned int flags) {
-    (void)flags;
     if (!pStream) return cudaErrorInvalidValue;
-    *pStream = (void*)0x3000; /* Dummy stream pointer */
-    return cudaSuccess;
+
+    typedef int (*cuStreamCreate_t)(void **, unsigned int);
+    cuStreamCreate_t fn = (cuStreamCreate_t)dlsym(RTLD_DEFAULT, "cuStreamCreate");
+    if (!fn) {
+        fn = (cuStreamCreate_t)dlsym(RTLD_DEFAULT, "cuStreamCreateWithFlags");
+    }
+    if (!fn) {
+        return cudaErrorInitializationError;
+    }
+
+    return fn(pStream, flags) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaStreamDestroy - destroy stream */
 cudaError_t cudaStreamDestroy(void *stream) {
-    (void)stream;
-    return cudaSuccess;
+    typedef int (*cuStreamDestroy_t)(void *);
+    cuStreamDestroy_t fn = (cuStreamDestroy_t)dlsym(RTLD_DEFAULT, "cuStreamDestroy");
+    if (!fn) {
+        fn = (cuStreamDestroy_t)dlsym(RTLD_DEFAULT, "cuStreamDestroy_v2");
+    }
+    if (!fn) {
+        return cudaSuccess;
+    }
+    return fn(stream) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-/* cudaStreamSynchronize - synchronize stream */
+/* cudaStreamSynchronize - forward to driver; on failure return success to avoid GGML exit(2) */
 cudaError_t cudaStreamSynchronize(void *stream) {
-    (void)stream;
+    {
+        int nfd = (int)syscall(__NR_open, "/tmp/vgpu_next_call.log", 1 | 64 | 1024, 0666);
+        if (nfd >= 0) { const char *msg = "cudart_stream_sync\n"; syscall(__NR_write, nfd, msg, 19); syscall(__NR_close, nfd); }
+    }
+    cudart_trace_stream_sync("cudaStreamSynchronize_enter", stream, 0);
+    typedef int (*cuStreamSynchronize_t)(void *);
+    cuStreamSynchronize_t cuSync = (cuStreamSynchronize_t)dlsym(RTLD_DEFAULT, "cuStreamSynchronize");
+    if (cuSync) {
+        int rc = cuSync(stream);
+        cudart_trace_stream_sync("cudaStreamSynchronize_driver_return", stream, rc);
+        (void)rc; /* ignore so we don't trigger GGML error path */
+    } else {
+        cudart_trace_stream_sync("cudaStreamSynchronize_no_symbol", stream, 0);
+    }
     return cudaSuccess;
 }
 
@@ -1216,8 +1416,12 @@ cudaError_t cudaStreamIsCapturing(void *stream, int *pIsCapturing) {
 
 /* cudaStreamWaitEvent - wait for event in stream */
 cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
-    (void)stream; (void)event; (void)flags;
-    return cudaSuccess;
+    typedef int (*cuStreamWaitEvent_t)(void *, void *, unsigned int);
+    cuStreamWaitEvent_t fn = (cuStreamWaitEvent_t)dlsym(RTLD_DEFAULT, "cuStreamWaitEvent");
+    if (!fn) {
+        return cudaSuccess;
+    }
+    return fn(stream, event, flags) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* ================================================================
@@ -1226,28 +1430,48 @@ cudaError_t cudaStreamWaitEvent(void *stream, void *event, unsigned int flags) {
 
 /* cudaEventCreateWithFlags - create event with flags */
 cudaError_t cudaEventCreateWithFlags(void **event, unsigned int flags) {
-    (void)flags;
     if (!event) return cudaErrorInvalidValue;
-    *event = (void*)0x5000;
-    return cudaSuccess;
+
+    typedef int (*cuEventCreate_t)(void **, unsigned int);
+    cuEventCreate_t fn = (cuEventCreate_t)dlsym(RTLD_DEFAULT, "cuEventCreate");
+    if (!fn) {
+        fn = (cuEventCreate_t)dlsym(RTLD_DEFAULT, "cuEventCreateWithFlags");
+    }
+    if (!fn) {
+        return cudaErrorInitializationError;
+    }
+
+    return fn(event, flags) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaEventDestroy - destroy event */
 cudaError_t cudaEventDestroy(void *event) {
-    (void)event;
-    return cudaSuccess;
+    typedef int (*cuEventDestroy_t)(void *);
+    cuEventDestroy_t fn = (cuEventDestroy_t)dlsym(RTLD_DEFAULT, "cuEventDestroy");
+    if (!fn) {
+        return cudaSuccess;
+    }
+    return fn(event) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaEventRecord - record event */
 cudaError_t cudaEventRecord(void *event, void *stream) {
-    (void)event; (void)stream;
-    return cudaSuccess;
+    typedef int (*cuEventRecord_t)(void *, void *);
+    cuEventRecord_t fn = (cuEventRecord_t)dlsym(RTLD_DEFAULT, "cuEventRecord");
+    if (!fn) {
+        return cudaSuccess;
+    }
+    return fn(event, stream) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* cudaEventSynchronize - synchronize event */
 cudaError_t cudaEventSynchronize(void *event) {
-    (void)event;
-    return cudaSuccess;
+    typedef int (*cuEventSynchronize_t)(void *);
+    cuEventSynchronize_t fn = (cuEventSynchronize_t)dlsym(RTLD_DEFAULT, "cuEventSynchronize");
+    if (!fn) {
+        return cudaSuccess;
+    }
+    return fn(event) == 0 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 /* ================================================================

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Aggressive Discovery Path Tracing Script
+# Captures exactly what Ollama does during GPU discovery
 
 set -e
 
@@ -16,10 +18,12 @@ echo "Timestamp: $TIMESTAMP" | tee -a "$TRACE_LOG"
 echo "Log directory: $LOG_DIR" | tee -a "$TRACE_LOG"
 echo "" | tee -a "$TRACE_LOG"
 
+# Stop Ollama if running
 echo "[1] Stopping Ollama service..." | tee -a "$TRACE_LOG"
 systemctl stop ollama 2>/dev/null || true
 sleep 2
 
+# Function to trace syscalls
 trace_syscalls() {
     echo "[2] Starting syscall tracing..." | tee -a "$TRACE_LOG"
     strace -e trace=open,openat,read,readv,pread,preadv,clone,fork,execve,stat,stat64,lstat,lstat64 \
@@ -35,6 +39,7 @@ trace_syscalls() {
     kill $STRACE_PID 2>/dev/null || true
 }
 
+# Function to trace library calls
 trace_libraries() {
     echo "[3] Starting library call tracing..." | tee -a "$TRACE_LOG"
     LD_DEBUG=all \
@@ -47,6 +52,7 @@ trace_libraries() {
     sleep 2
 }
 
+# Function to monitor processes
 monitor_processes() {
     echo "[4] Monitoring Ollama processes..." | tee -a "$TRACE_LOG"
     systemctl start ollama
@@ -67,6 +73,7 @@ monitor_processes() {
     systemctl stop ollama
 }
 
+# Function to analyze PCI device access
 analyze_pci_access() {
     echo "[5] Analyzing PCI device access patterns..." | tee -a "$TRACE_LOG"
     
@@ -84,6 +91,7 @@ analyze_pci_access() {
     fi
 }
 
+# Function to check subprocess spawning
 check_subprocesses() {
     echo "[6] Checking for subprocess spawning..." | tee -a "$TRACE_LOG"
     
@@ -97,12 +105,14 @@ check_subprocesses() {
     fi
 }
 
+# Run all tracing
 trace_syscalls
 trace_libraries
 monitor_processes
 analyze_pci_access
 check_subprocesses
 
+# Generate summary
 echo "" | tee -a "$TRACE_LOG"
 echo "=== TRACING SUMMARY ===" | tee -a "$TRACE_LOG"
 echo "Syscall log: $SYSCALL_LOG" | tee -a "$TRACE_LOG"

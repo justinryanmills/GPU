@@ -62,6 +62,9 @@
 /* Helper macro for register access */
 #define REG32(base, off)  (*(volatile uint32_t *)((volatile char *)(base) + (off)))
 
+/*
+ * VGPURequest structure (from vgpu_protocol.h)
+ */
 typedef struct __attribute__((packed)) {
     uint32_t version;
     uint32_t opcode;
@@ -72,6 +75,9 @@ typedef struct __attribute__((packed)) {
     uint32_t reserved[2];
 } VGPURequest;
 
+/*
+ * VGPUResponse structure (from vgpu_protocol.h)
+ */
 typedef struct __attribute__((packed)) {
     uint32_t version;
     uint32_t status;
@@ -82,12 +88,19 @@ typedef struct __attribute__((packed)) {
     uint32_t reserved[2];
 } VGPUResponse;
 
+/*
+ * vGPU Properties Structure
+ */
 typedef struct {
     char pool_id;
     uint32_t priority;
     uint32_t vm_id;
 } VGPUProperties;
 
+/*
+ * Find vGPU stub device by scanning PCI devices
+ * Returns path to resource0 file, or NULL if not found
+ */
 static char* find_vgpu_device(void) {
     static char device_path[1024];
     DIR *dir;

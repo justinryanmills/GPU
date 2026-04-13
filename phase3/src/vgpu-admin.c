@@ -1,8 +1,14 @@
-/* vGPU admin CLI (Step 2-4). */
-#define _POSIX_C_SOURCE 200809L
+/*
+ * vGPU Administration CLI Tool
+ * Configuration & Management Interface (Step 2-4)
+ *
+ * Usage: vgpu-admin <command> [options]
+ */
+
+#define _POSIX_C_SOURCE 200809L  /* For popen/pclose */
 
 #include "vgpu_config.h"
-#include "vgpu_protocol.h"
+#include "vgpu_protocol.h"      /* Phase 3: admin socket protocol */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +22,7 @@
 #define MAX_VMS 1000
 #define MAX_LINE 1024
 
+/* Forward declarations */
 static int confirm_apply_settings(const char *vm_uuid, char old_pool, char new_pool,
                                   int old_priority, int new_priority,
                                   int old_vm_id, int new_vm_id);
@@ -25,7 +32,7 @@ static int vm_stop_and_verify(const char *vm_uuid);
 static int vm_start(const char *vm_uuid);
 static int update_device_model_args(const char *vm_uuid, char pool_id, int priority, int vm_id);
 static int get_device_model_args(const char *vm_uuid, char *args, size_t args_size);
-static int scan_xcpng_vms(void);
+static int scan_xcpng_vms(sqlite3 *db);
 static int get_vm_name(const char *vm_uuid, char *name, size_t name_size);
 static int get_vm_uuid_from_name(const char *vm_name, char *uuid, size_t uuid_size);
 static int get_vm_power_state(const char *vm_uuid, char *state, size_t state_size);
@@ -36,6 +43,10 @@ static const char *priority_str(int priority);
 static int parse_priority(const char *str);
 static char parse_pool_id(const char *str);
 
+/* ============================================================================
+ * VM UUID Resolution Helper
+ * Resolves --vm-uuid or --vm-name to a UUID consistently
+ * ============================================================================ */
 
 static int resolve_vm_uuid(int argc, char *argv[], const char **out_uuid,
                            char *uuid_buf, size_t uuid_buf_size) {
@@ -75,6 +86,9 @@ static int resolve_vm_uuid(int argc, char *argv[], const char **out_uuid,
     return 0;
 }
 
+/* ============================================================================
+ * Phase 3: Admin Socket Helper — send a command to the mediator daemon
+ * ============================================================================ */
 
 static int admin_socket_query(uint32_t command, uint32_t param1, uint32_t param2,
                               char *response_buf, size_t response_buf_size) {
@@ -142,6 +156,9 @@ static int admin_socket_query(uint32_t command, uint32_t param1, uint32_t param2
     return (int)resp.status;
 }
 
+/* ============================================================================
+ * Main
+ * ============================================================================ */
 
 int main(int argc, char *argv[]) {
     sqlite3 *db;
@@ -319,7 +336,7 @@ int main(int argc, char *argv[]) {
         
     } else if (strcmp(cmd, "scan-vms") == 0) {
         /* vgpu-admin scan-vms */
-        scan_xcpng_vms();
+        scan_xcpng_vms(db);
         
     } else if (strcmp(cmd, "show-vm") == 0) {
         /* vgpu-admin show-vm (--vm-uuid=<uuid> | --vm-name=<name>) */
@@ -849,8 +866,12 @@ int main(int argc, char *argv[]) {
         
         /* Show unregistered VMs */
         printf("=== Unregistered VMs ===\n");
-        scan_xcpng_vms();
+        scan_xcpng_vms(db);
         
+    /* ==================================================================
+     * Phase 3: Scheduler Weight & Isolation Commands
+     * ================================================================== */
+
     } else if (strcmp(cmd, "set-weight") == 0) {
         /* vgpu-admin set-weight (--vm-uuid=<uuid> | --vm-name=<name>) --weight=<1-100> */
         const char *vm_uuid = NULL;
@@ -1104,6 +1125,10 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
+/* ============================================================================
+ * Helper Functions
+ * ============================================================================ */
+
 static int confirm_apply_settings(const char *vm_uuid, char old_pool, char new_pool,
                                   int old_priority, int new_priority,
                                   int old_vm_id, int new_vm_id) {
@@ -1250,23 +1275,34 @@ static int get_device_model_args(const char *vm_uuid, char *args, size_t args_si
     return 0;
 }
 
-static int scan_xcpng_vms(void) {
+static int xe_toolstack_reachable(void) {
+    int st = system("xe host-list params=uuid --minimal >/dev/null 2>&1");
+    if (st == -1)
+        return 0;
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        return 0;
+    return 1;
+}
+
+static int scan_xcpng_vms(sqlite3 *db) {
     FILE *fp;
     char line[MAX_LINE];
-    sqlite3 *db;
-    
-    if (vgpu_db_init(&db) != VGPU_OK) {
-        fprintf(stderr, "Error: Failed to initialize database\n");
+
+    if (!db) {
+        fprintf(stderr, "Error: internal database handle is NULL\n");
         return 1;
     }
-    
-    vgpu_db_init_schema(db);
-    
-    /* Get all VM UUIDs from XCP-ng (one per line) */
-    fp = popen("xe vm-list is-control-domain=false params=uuid --minimal 2>/dev/null | tr ',' '\\n'", "r");
+
+    if (!xe_toolstack_reachable()) {
+        fprintf(stderr,
+                "Warning: `xe` did not succeed (exit non-zero). "
+                "Run vgpu-admin on the pool master dom0 as root, or check xapi (systemctl status xapi).\n");
+    }
+
+    /* Get all VM UUIDs from XCP-ng (one per line); include stderr so errors are visible */
+    fp = popen("xe vm-list is-control-domain=false params=uuid --minimal 2>&1 | tr ',' '\\n'", "r");
     if (!fp) {
         fprintf(stderr, "Error: Failed to query XCP-ng\n");
-        vgpu_db_close(db);
         return 1;
     }
     
@@ -1325,8 +1361,17 @@ static int scan_xcpng_vms(void) {
         }
     }
     
-    pclose(fp);
-    
+    int px = pclose(fp);
+    if (px == -1) {
+        fprintf(stderr, "Error: Failed to close xe pipeline\n");
+        return 1;
+    }
+    if (!WIFEXITED(px) || WEXITSTATUS(px) != 0) {
+        fprintf(stderr,
+                "Warning: xe vm-list pipeline exited with status %d (VM list may be incomplete).\n",
+                WIFEXITED(px) ? WEXITSTATUS(px) : -1);
+    }
+
     /* Print Pool A VMs */
     if (pool_a_count > 0) {
         printf("\n=== Pool A: %d VMs ===\n", pool_a_count);
@@ -1342,7 +1387,7 @@ static int scan_xcpng_vms(void) {
                    priority_str(pool_a_vms[i].priority),
                    pool_a_vms[i].priority,
                    pool_a_vms[i].vm_id,
-                   device_args[0] ? "Configured" : "⚠ Not configured");
+                   device_args[0] ? "✓ Configured" : "⚠ Not configured");
         }
     }
     
@@ -1361,7 +1406,7 @@ static int scan_xcpng_vms(void) {
                    priority_str(pool_b_vms[i].priority),
                    pool_b_vms[i].priority,
                    pool_b_vms[i].vm_id,
-                   device_args[0] ? "Configured" : "⚠ Not configured");
+                   device_args[0] ? "✓ Configured" : "⚠ Not configured");
         }
     }
     
@@ -1379,8 +1424,7 @@ static int scan_xcpng_vms(void) {
     } else if (pool_a_count == 0 && pool_b_count == 0) {
         printf("\nNo VMs found.\n");
     }
-    
-    vgpu_db_close(db);
+
     return 0;
 }
 

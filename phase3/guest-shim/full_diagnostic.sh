@@ -1,4 +1,5 @@
 #!/bin/bash
+# Comprehensive diagnostic and deployment script
 
 exec > /tmp/vgpu_full_diagnostic.log 2>&1
 
@@ -8,13 +9,14 @@ echo "Date: $(date)"
 echo "=========================================="
 echo ""
 
+# Step 1: Check current state
 echo "=== STEP 1: Current State ==="
 echo ""
 
 echo "[1.1] Source file check:"
 if [ -f ~/phase3/guest-shim/libvgpu_cuda.c ]; then
-    echo "  Source file exists"
-    grep -n "Pre-initializing CUDA at load time" ~/phase3/guest-shim/libvgpu_cuda.c && echo "  cuInit fix is in source" || echo "  ✗ cuInit fix NOT in source"
+    echo "  ✓ Source file exists"
+    grep -n "Pre-initializing CUDA at load time" ~/phase3/guest-shim/libvgpu_cuda.c && echo "  ✓ cuInit fix is in source" || echo "  ✗ cuInit fix NOT in source"
 else
     echo "  ✗ Source file NOT found"
 fi
@@ -52,6 +54,7 @@ else
 fi
 echo ""
 
+# Step 2: Deploy fix
 echo "=== STEP 2: Deploying Fix ==="
 echo ""
 
@@ -66,7 +69,7 @@ sudo gcc -shared -fPIC -o /usr/lib64/libvgpu-cuda.so \
     -I../include -I. -ldl -lpthread -O2 -Wall 2>&1
 
 if [ $? -eq 0 ]; then
-    echo "  Build successful"
+    echo "  ✓ Build successful"
     ls -lh /usr/lib64/libvgpu-cuda.so
 else
     echo "  ✗ Build failed"
@@ -77,9 +80,9 @@ echo ""
 echo "[2.2] Ensuring /etc/ld.so.preload:"
 if ! grep -q "libvgpu-cuda.so" /etc/ld.so.preload 2>/dev/null; then
     echo "/usr/lib64/libvgpu-cuda.so" | sudo tee -a /etc/ld.so.preload
-    echo "  Added to /etc/ld.so.preload"
+    echo "  ✓ Added to /etc/ld.so.preload"
 else
-    echo "  Already in /etc/ld.so.preload"
+    echo "  ✓ Already in /etc/ld.so.preload"
 fi
 cat /etc/ld.so.preload
 echo ""
@@ -91,13 +94,14 @@ sudo systemctl start ollama
 sleep 10
 
 if systemctl is-active --quiet ollama; then
-    echo "  Ollama is running"
+    echo "  ✓ Ollama is running"
 else
     echo "  ✗ Ollama failed to start"
     sudo systemctl status ollama --no-pager -l | head -20
 fi
 echo ""
 
+# Step 3: Verify
 echo "=== STEP 3: Verification ==="
 echo ""
 
@@ -111,7 +115,7 @@ if [ -n "$OLLAMA_PID" ]; then
         cat "/tmp/vgpu-shim-cuda-${OLLAMA_PID}.log"
         echo ""
         if grep -q "Pre-initialization succeeded" "/tmp/vgpu-shim-cuda-${OLLAMA_PID}.log"; then
-            echo "  Pre-initialization SUCCESS"
+            echo "  ✓ Pre-initialization SUCCESS"
         else
             echo "  ✗ Pre-initialization not found in log"
         fi

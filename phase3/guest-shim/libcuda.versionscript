@@ -1,0 +1,6 @@
+CUDA_1.0 {
+  global:
+    cu*;
+  local:
+    *;
+};

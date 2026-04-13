@@ -1,4 +1,5 @@
 #!/bin/bash
+# Status check script - shows current state of shim installation
 
 PASS="Calvin@123"
 

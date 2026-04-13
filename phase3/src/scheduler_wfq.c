@@ -1,7 +1,23 @@
-/* Phase 3: WFQ scheduler (urgency = base * weight * (1+pressure) * (1+wait_bonus)). */
+/*
+ * Phase 3: Demand-Aware Weighted Fair Queuing Scheduler
+ *
+ * Urgency score formula:
+ *   base_mult = priority==2 ? 4.0 : priority==1 ? 2.0 : 1.0
+ *   weight_mult = weight / 50.0       (weight 1-100, default 50)
+ *   pressure    = vm_queue_depth / 10.0
+ *   wait_bonus  = elapsed_sec / 10.0
+ *   urgency     = base_mult * weight_mult * (1.0 + pressure) * (1.0 + wait_bonus)
+ *
+ * The queue is a simple array sorted on dequeue (selection sort of max).
+ * For the expected queue sizes (tens to low hundreds), this is efficient
+ * enough and avoids heap complexity.
+ */
+
 #include "scheduler_wfq.h"
 #include <string.h>
 #include <stdio.h>
+
+/* ---- Internal helpers -------------------------------------------------- */
 
 static wfq_vm_stats_t *find_or_create_vm(wfq_scheduler_t *sched, uint32_t vm_id)
 {
@@ -39,6 +55,8 @@ static double compute_urgency(const wfq_entry_t *e, int vm_queue_depth)
     return base * weight_mult * (1.0 + pressure) * (1.0 + wait_bonus);
 }
 
+/* ---- Public API -------------------------------------------------------- */
+
 void wfq_init(wfq_scheduler_t *sched)
 {
     memset(sched, 0, sizeof(*sched));
@@ -59,15 +77,20 @@ int wfq_enqueue(wfq_scheduler_t *sched, const wfq_entry_t *entry)
         return -1;
     }
 
+    /* Copy entry into queue */
     wfq_entry_t *slot = &sched->queue[sched->queue_len];
     memcpy(slot, entry, sizeof(*slot));
     clock_gettime(CLOCK_MONOTONIC, &slot->enqueue_time);
 
     sched->queue_len++;
+
+    /* Update per-VM stats */
     wfq_vm_stats_t *vs = find_or_create_vm(sched, entry->vm_id);
     if (vs) {
         vs->current_queue_depth++;
         vs->total_submitted++;
+
+        /* Update submit rate (simple exponential moving average) */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double dt = (now.tv_sec - vs->last_submit_time.tv_sec)

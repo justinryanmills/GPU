@@ -1,4 +1,6 @@
 #!/bin/bash
+# Deploy dlsym interception to VM
+# Run this script on the VM: bash deploy_dlsym_interception.sh
 
 set -e
 
@@ -15,7 +17,7 @@ sudo ./install.sh 2>&1 | tail -40
 echo ""
 echo "[2/5] Verifying dlsym symbol in libvgpu-cuda.so..."
 if nm -D ~/phase3/guest-shim/libvgpu-cuda.so 2>/dev/null | grep -q " dlsym"; then
-    echo "  dlsym symbol found"
+    echo "  ✓ dlsym symbol found"
     nm -D ~/phase3/guest-shim/libvgpu-cuda.so 2>/dev/null | grep " dlsym" | head -3
 else
     echo "  ⚠ dlsym symbol not found - checking build..."
@@ -25,7 +27,7 @@ fi
 echo ""
 echo "[3/5] Restarting Ollama service..."
 sudo systemctl restart ollama
-echo "  Ollama restarted"
+echo "  ✓ Ollama restarted"
 
 echo ""
 echo "[4/5] Waiting for discovery (8 seconds)..."

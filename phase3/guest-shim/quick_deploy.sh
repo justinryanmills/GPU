@@ -1,4 +1,5 @@
 #!/bin/bash
+# Quick deployment and status check
 
 cd ~/phase3/guest-shim 2>/dev/null || { echo "ERROR: ~/phase3/guest-shim not found"; exit 1; }
 

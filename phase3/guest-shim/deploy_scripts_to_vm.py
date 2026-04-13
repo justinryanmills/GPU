@@ -62,7 +62,7 @@ PYEOF
         child.sendline(f'cd ~/phase3/guest-shim && test -f {script_name} && echo "OK" || echo "FAILED"')
         child.expect(r'\$', timeout=5)
         if 'OK' in child.before:
-            print(f"    {script_name} deployed")
+            print(f"    ✓ {script_name} deployed")
         else:
             print(f"    ✗ Failed to deploy {script_name}")
     

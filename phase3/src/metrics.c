@@ -1,9 +1,17 @@
-/* Phase 3: Metrics (latency, p50/p95/p99, Prometheus export). */
+/*
+ * Phase 3: Metrics Collector
+ *
+ * Tracks per-VM and global latency histograms (sliding-window circular buffer),
+ * computes p50/p95/p99 percentiles on demand, and exports in Prometheus format.
+ */
+
 #include "metrics.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+
+/* ---- Internal ---------------------------------------------------------- */
 
 static metrics_vm_t *find_or_create_vm(metrics_t *m, uint32_t vm_id)
 {
@@ -11,6 +19,7 @@ static metrics_vm_t *find_or_create_vm(metrics_t *m, uint32_t vm_id)
         if (m->vms[i].active && m->vms[i].vm_id == vm_id)
             return &m->vms[i];
     }
+    /* Allocate new */
     for (int i = 0; i < METRICS_MAX_VMS; i++) {
         if (!m->vms[i].active) {
             memset(&m->vms[i], 0, sizeof(m->vms[i]));
@@ -22,6 +31,7 @@ static metrics_vm_t *find_or_create_vm(metrics_t *m, uint32_t vm_id)
     return NULL;
 }
 
+/* Comparison function for qsort */
 static int cmp_uint64(const void *a, const void *b)
 {
     uint64_t va = *(const uint64_t *)a;
@@ -31,6 +41,10 @@ static int cmp_uint64(const void *a, const void *b)
     return 0;
 }
 
+/*
+ * Compute percentile from a circular buffer of samples.
+ * Returns 0 if no samples available.
+ */
 static uint64_t compute_percentile(const uint64_t *samples, int sample_count,
                                     int window_size, int percentile)
 {
@@ -58,6 +72,8 @@ static uint64_t compute_percentile(const uint64_t *samples, int sample_count,
     free(tmp);
     return result;
 }
+
+/* ---- Public API -------------------------------------------------------- */
 
 void metrics_init(metrics_t *m)
 {

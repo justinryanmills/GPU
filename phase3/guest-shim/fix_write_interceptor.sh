@@ -1,4 +1,5 @@
 #!/bin/bash
+# Fix write interceptor and rebuild on VM
 
 set -e
 

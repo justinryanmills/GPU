@@ -1,10 +1,21 @@
-/* Phase 3: Watchdog — job timeout, fault tracking, quarantine, NVML health. */
+/*
+ * Phase 3: Watchdog & Error Recovery
+ *
+ * Runs a background thread that:
+ *   1. Monitors the currently executing CUDA job for timeout
+ *   2. Tracks per-VM fault counters
+ *   3. Auto-quarantines VMs that exceed the fault threshold
+ *   4. Polls NVML for GPU health (via nvml_monitor.h)
+ */
+
 #include "watchdog.h"
 #include "nvml_monitor.h"
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
+
+/* ---- Internal ---------------------------------------------------------- */
 
 static wd_vm_state_t *find_or_create_vm(watchdog_t *wd, uint32_t vm_id)
 {
@@ -33,6 +44,7 @@ static void *watchdog_thread(void *arg)
 
         pthread_mutex_lock(&wd->lock);
 
+        /* 1. Check for job timeout */
         if (wd->active_job.active) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -44,6 +56,7 @@ static void *watchdog_thread(void *arg)
                        wd->active_job.vm_id, wd->active_job.request_id,
                        elapsed, wd->job_timeout_sec);
 
+                /* Record fault for this VM */
                 wd_vm_state_t *vs = find_or_create_vm(wd, wd->active_job.vm_id);
                 if (vs) {
                     vs->error_count++;
@@ -56,10 +69,12 @@ static void *watchdog_thread(void *arg)
                     }
                 }
 
+                /* Mark job as no longer active (mediator should handle the timeout) */
                 wd->active_job.active = 0;
             }
         }
 
+        /* 2. Poll NVML for GPU health */
         nvml_poll(&health);
         if (health.available && health.needs_reset) {
             if (!wd->gpu_reset_detected) {
@@ -78,6 +93,8 @@ static void *watchdog_thread(void *arg)
     printf("[WATCHDOG] Stopped\n");
     return NULL;
 }
+
+/* ---- Public API -------------------------------------------------------- */
 
 void wd_init(watchdog_t *wd)
 {

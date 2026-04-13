@@ -1,10 +1,12 @@
 #!/bin/bash
+# Fix Shim Loading - Reload systemd and restart Ollama
 
 set -e
 
 echo "=== Fixing Ollama Shim Loading ==="
 echo ""
 
+# Check current state
 echo "[1] Checking current Ollama process..."
 MAIN_PID=$(pgrep -f "ollama serve" | head -1)
 if [ -n "$MAIN_PID" ]; then
@@ -41,7 +43,7 @@ if [ -n "$NEW_PID" ]; then
     
     if cat /proc/$NEW_PID/maps 2>/dev/null | grep -q libvgpu; then
         echo ""
-        echo "  SUCCESS: Shims are loaded!"
+        echo "  ✓ SUCCESS: Shims are loaded!"
     else
         echo ""
         echo "  ✗ FAILED: Shims are still not loaded"

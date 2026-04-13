@@ -1,20 +1,51 @@
+/*
+ * GPU Properties — H100 80GB PCIe defaults
+ *
+ * These constants are used by the guest-side CUDA shim library to
+ * answer cuDeviceGetAttribute() and similar queries BEFORE the shim
+ * has connected to the host and fetched live values.
+ *
+ * Once the shim connects and calls CUDA_CALL_GET_GPU_INFO, the live
+ * values from the host replace these defaults.
+ *
+ * Values sourced from:
+ *   https://www.nvidia.com/en-us/data-center/h100/
+ *   CUDA Toolkit deviceQuery sample output for H100 PCIe
+ */
+
 #ifndef GPU_PROPERTIES_H
 #define GPU_PROPERTIES_H
 
+/* ---- Device identity ------------------------------------------- */
 #define GPU_DEFAULT_NAME            "HEXACORE vH100 CAP"
-#define GPU_DEFAULT_PCI_DEVICE_ID   0x2331
-#define GPU_DEFAULT_PCI_VENDOR_ID   0x10DE
+#define GPU_DEFAULT_PCI_DEVICE_ID   0x2331   /* H100 PCIe */
+#define GPU_DEFAULT_PCI_VENDOR_ID   0x10DE   /* NVIDIA     */
+
+/* ---- Compute capability ---------------------------------------- */
+/* H100 Hopper = 9.0. Prior 8.9 (Ada) workaround caused libcublasLt to
+ * select sm_80 Ampere fatbins. GGML CUDA is built with sm_90
+ * (CMAKE_CUDA_ARCHITECTURES=90); advertise
+ * true CC so BLASLt / runtime pick Hopper-compatible kernel packages.
+ */
 #define GPU_DEFAULT_CC_MAJOR        9
 #define GPU_DEFAULT_CC_MINOR        0
-#define GPU_DEFAULT_SM_COUNT        132
-#define GPU_DEFAULT_CORES_PER_SM    128
-#define GPU_DEFAULT_TOTAL_MEM       (80ULL * 1024 * 1024 * 1024)
-#define GPU_DEFAULT_FREE_MEM        (78ULL * 1024 * 1024 * 1024)
-#define GPU_DEFAULT_MEM_BUS_WIDTH   5120
-#define GPU_DEFAULT_L2_CACHE_SIZE   (52428800)
+
+/* ---- Core counts ----------------------------------------------- */
+#define GPU_DEFAULT_SM_COUNT        132      /* Streaming Multiprocessors */
+#define GPU_DEFAULT_CORES_PER_SM    128      /* FP32 cores per SM         */
+
+/* ---- Memory ---------------------------------------------------- */
+#define GPU_DEFAULT_TOTAL_MEM       (80ULL * 1024 * 1024 * 1024)  /* 80 GB */
+#define GPU_DEFAULT_FREE_MEM        (78ULL * 1024 * 1024 * 1024)  /* ~78 GB */
+#define GPU_DEFAULT_MEM_BUS_WIDTH   5120     /* bits */
+#define GPU_DEFAULT_L2_CACHE_SIZE   (52428800) /* 50 MB */
 #define GPU_DEFAULT_ECC_ENABLED     1
-#define GPU_DEFAULT_CLOCK_RATE_KHZ        1620000
-#define GPU_DEFAULT_MEM_CLOCK_RATE_KHZ    1593000
+
+/* ---- Clocks ---------------------------------------------------- */
+#define GPU_DEFAULT_CLOCK_RATE_KHZ        1620000   /* 1620 MHz core  */
+#define GPU_DEFAULT_MEM_CLOCK_RATE_KHZ    1593000   /* 1593 MHz HBM3  */
+
+/* ---- Thread / block limits ------------------------------------- */
 #define GPU_DEFAULT_MAX_THREADS_PER_BLOCK   1024
 #define GPU_DEFAULT_MAX_BLOCK_DIM_X         1024
 #define GPU_DEFAULT_MAX_BLOCK_DIM_Y         1024
@@ -24,17 +55,24 @@
 #define GPU_DEFAULT_MAX_GRID_DIM_Z          65535
 #define GPU_DEFAULT_WARP_SIZE               32
 #define GPU_DEFAULT_MAX_THREADS_PER_SM      2048
-#define GPU_DEFAULT_SHARED_MEM_PER_BLOCK    (49152)
-#define GPU_DEFAULT_SHARED_MEM_PER_SM       (233472)
+
+/* ---- Shared memory / registers --------------------------------- */
+#define GPU_DEFAULT_SHARED_MEM_PER_BLOCK    (49152)     /* 48 KiB static per block */
+/* Hopper: GGML MMQ uses smpbo = cudaDeviceProp.sharedMemPerBlockOptin (ggml-cuda.cu).
+ * If this is only 48 KiB, mmq_get_nbytes_shared > smpbo for all tiles → mmq_x_best=0 → GGML_ABORT. */
+#define GPU_DEFAULT_SHARED_MEM_PER_BLOCK_OPTIN (227328) /* 222 KiB — H100 max opt-in per block */
+#define GPU_DEFAULT_SHARED_MEM_PER_SM       (233472)    /* 228 KB */
 #define GPU_DEFAULT_REGS_PER_BLOCK          65536
 #define GPU_DEFAULT_REGS_PER_SM             65536
+
+/* ---- Feature flags --------------------------------------------- */
 #define GPU_DEFAULT_CONCURRENT_KERNELS      1
 #define GPU_DEFAULT_UNIFIED_ADDRESSING      1
 #define GPU_DEFAULT_MANAGED_MEMORY          1
 #define GPU_DEFAULT_ASYNC_ENGINE_COUNT      3
 #define GPU_DEFAULT_CAN_MAP_HOST_MEM        1
-#define GPU_DEFAULT_COMPUTE_MODE            0
-#define GPU_DEFAULT_INTEGRATED              0
+#define GPU_DEFAULT_COMPUTE_MODE            0  /* cudaComputeModeDefault */
+#define GPU_DEFAULT_INTEGRATED              0  /* discrete GPU */
 #define GPU_DEFAULT_MULTI_GPU_BOARD         0
 #define GPU_DEFAULT_COOPERATIVE_LAUNCH      1
 #define GPU_DEFAULT_GLOBAL_L1_CACHE_SUPPORT 1
@@ -49,11 +87,25 @@
 #define GPU_DEFAULT_MAX_PITCH               (2147483647)
 #define GPU_DEFAULT_TOTAL_CONSTANT_MEM      65536
 #define GPU_DEFAULT_CLOCK_INSTRUCTION_RATE  32
+
+/* ---- PCI topology (placeholder) -------------------------------- */
 #define GPU_DEFAULT_PCI_BUS_ID              0
 #define GPU_DEFAULT_PCI_DEV_ID              0
 #define GPU_DEFAULT_PCI_DOMAIN_ID           0
-#define GPU_DEFAULT_DRIVER_VERSION          13000
-#define GPU_DEFAULT_RUNTIME_VERSION         12080
+
+/* ---- Driver / runtime version ---------------------------------- */
+/* CRITICAL: CUDA runtime (libcudart.so.12) checks driver version.
+ * Error: "CUDA driver version is insufficient for CUDA runtime version"
+ * We need to return a version that's >= what the runtime expects.
+ *
+ * Keep the default aligned with the runtime baseline until live host GPU info
+ * is fetched. Advertising a synthetic 13.0 here feeds the dark-API integrity
+ * token path and can make ggml_cuda_init reject CUDA before discovery settles.
+ * Format: major * 1000 + minor * 10. */
+#define GPU_DEFAULT_DRIVER_VERSION          12080  /* CUDA 12.8 default until live host info replaces it */
+#define GPU_DEFAULT_RUNTIME_VERSION         12080  /* CUDA 12.8 runtime */
+
+/* ---- UUID (placeholder — 16 zero bytes, host fills in real one) - */
 #define GPU_DEFAULT_UUID_BYTES  \
     { 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, \
       0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00 }

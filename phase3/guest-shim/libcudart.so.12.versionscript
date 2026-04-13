@@ -1,0 +1,14 @@
+libcudart.so.12 {
+  global:
+    cuda*;
+    __cuda*;
+    __cudaRegisterFatBinary;
+    __cudaRegisterFatBinaryEnd;
+    __cudaUnregisterFatBinary;
+    __cudaRegisterFunction;
+    __cudaRegisterVar;
+    __cudaPushCallConfiguration;
+    __cudaPopCallConfiguration;
+  local:
+    *;
+};

@@ -1,9 +1,17 @@
-/* Phase 3: NVML GPU health (dlopen, graceful fallback). */
+/*
+ * Phase 3: NVML GPU Health Monitor
+ *
+ * Uses dlopen("libnvidia-ml.so.1") at runtime to avoid hard compile-time
+ * dependency.  If the library is missing (e.g. dev machine without GPU),
+ * all functions gracefully return "unavailable" without crashing.
+ */
+
 #include "nvml_monitor.h"
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>
 
+/* NVML type definitions (enough to call the functions we need) */
 typedef int nvmlReturn_t;
 typedef void *nvmlDevice_t;
 
@@ -18,6 +26,7 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
+/* Function pointer types */
 typedef nvmlReturn_t (*nvmlInit_v2_t)(void);
 typedef nvmlReturn_t (*nvmlShutdown_t)(void);
 typedef nvmlReturn_t (*nvmlDeviceGetHandleByIndex_v2_t)(unsigned int, nvmlDevice_t *);
@@ -27,9 +36,12 @@ typedef nvmlReturn_t (*nvmlDeviceGetMemoryInfo_t)(nvmlDevice_t, nvmlMemory_t *);
 typedef nvmlReturn_t (*nvmlDeviceGetPowerUsage_t)(nvmlDevice_t, unsigned int *);
 typedef nvmlReturn_t (*nvmlDeviceGetTotalEccErrors_t)(nvmlDevice_t, int, int, unsigned long long *);
 
+/* Global state */
 static void *g_nvml_lib = NULL;
 static nvmlDevice_t g_device = NULL;
 static int g_available = 0;
+
+/* Function pointers */
 static nvmlInit_v2_t                     fp_init = NULL;
 static nvmlShutdown_t                    fp_shutdown = NULL;
 static nvmlDeviceGetHandleByIndex_v2_t   fp_getHandle = NULL;
@@ -45,6 +57,8 @@ static nvmlDeviceGetTotalEccErrors_t     fp_getEcc = NULL;
 /* ECC error types */
 #define NVML_MEMORY_ERROR_TYPE_UNCORRECTED 1
 #define NVML_VOLATILE_ECC 0
+
+/* ---- Public API -------------------------------------------------------- */
 
 int nvml_init(void)
 {

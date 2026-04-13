@@ -1,26 +1,3 @@
-# ============================================================================
-# Phase 3 — Self-Contained Build System
-#
-# All source files live under phase3/ — no cross-directory dependencies.
-#
-# Builds:
-#   mediator_phase3    — host-side GPU mediation daemon with WFQ, rate limiter,
-#                        watchdog, metrics, NVML, CUDA executor, and admin socket
-#   vgpu-admin         — admin CLI (C binary, uses libvgpu_config + sqlite)
-#   vm_client_enhanced — guest-side MMIO client with Phase 3 retry logic
-#
-# Guest shim libraries (built separately, installed inside VM):
-#   libvgpu-cuda.so    — CUDA Driver API shim (replaces libcuda.so)
-#   libvgpu-nvml.so    — NVML shim (replaces libnvidia-ml.so)
-#
-# Usage:
-#   make              — build all host binaries
-#   make guest        — build guest shim libraries (libvgpu-cuda.so, libvgpu-nvml.so)
-#   make client       — build vm_client_enhanced only (for guest deployment)
-#   make install      — install binaries and DB schema
-#   make clean        — remove build artefacts
-# ============================================================================
-
 CC       = gcc
 CFLAGS   = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
 LDFLAGS  = -lpthread -lsqlite3 -ldl -lm
